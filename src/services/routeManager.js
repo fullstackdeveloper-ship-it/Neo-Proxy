@@ -181,95 +181,60 @@ function registerNeocoreRoutes(app, allSites, server) {
     res.status(404).json({ error: 'Socket.io endpoint not found - no site detected' });
   });
 
-  // WebSocket upgrade handler - CRITICAL for WebSocket connections
+  // WebSocket upgrade handler - Rewrite URLs, let middleware handle the upgrade
+  // http-proxy-middleware with ws:true automatically handles upgrades for registered routes
+  // We just rewrite /socket.io/ to /vpn/{site}/neocore/socket.io/ and let middleware handle it
   if (server && socketProxies.size > 0) {
-    // Remove any existing upgrade listeners to avoid conflicts
-    server.removeAllListeners('upgrade');
-    
-    server.on('upgrade', (req, socket, head) => {
+    // Add upgrade listener that runs FIRST (before middleware handlers)
+    // Use prependListener to ensure it runs before middleware's handlers
+    server.prependListener('upgrade', (req, socket, head) => {
       let url = req.url || '';
-      const origin = req.headers.origin || '';
-      const referer = req.headers.referer || '';
       
-      console.log(`🔌 WebSocket upgrade: ${url}`);
-      console.log(`   Origin: ${origin}`);
-      console.log(`   Referer: ${referer}`);
-      
-      // If URL doesn't have site prefix, detect site and rewrite
+      // Only rewrite socket.io URLs without site prefix
       if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
+        const origin = req.headers.origin || '';
+        const referer = req.headers.referer || '';
+        
+        console.log(`🔌 WebSocket upgrade: ${url}`);
+        console.log(`   Origin: ${origin}, Referer: ${referer}`);
+        
+        // Detect site
         const site = detectSite(req, allSites);
-        if (site?.neocore?.enabled) {
-          // Rewrite URL to include site prefix
-          const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-          url = `/vpn/${site.name}/neocore/socket.io${queryString}`;
-          req.url = url;
-          console.log(`   ✅ Site detected: ${site.name}, rewritten to: ${url}`);
-        } else {
-          // Try to extract site from referer or origin
-          let detectedSite = null;
-          
-          // Check referer first (most reliable for WebSocket upgrades)
+        let targetSite = site;
+        
+        if (!targetSite?.neocore?.enabled) {
+          // Try referer
           if (referer) {
             const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
             if (refererMatch) {
-              detectedSite = allSites[refererMatch[1]];
+              targetSite = allSites[refererMatch[1]];
             }
           }
           
-          // Check origin as fallback
-          if (!detectedSite && origin) {
-            // Origin doesn't have path, but we can check if it matches any site's target
-            // This is less reliable, so we'll use first site as fallback
-            const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
-            if (firstSite) {
-              detectedSite = firstSite;
-              console.log(`   ⚠️  Using fallback site: ${firstSite.name} (could not detect from headers)`);
-            }
-          }
-          
-          if (detectedSite?.neocore?.enabled) {
-            const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-            url = `/vpn/${detectedSite.name}/neocore/socket.io${queryString}`;
-            req.url = url;
-            console.log(`   ✅ Using detected site: ${detectedSite.name}`);
-          } else {
-            // Last resort: use first available site
-            const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
-            if (firstSite) {
-              const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-              url = `/vpn/${firstSite.name}/neocore/socket.io${queryString}`;
-              req.url = url;
-              console.log(`   ⚠️  No site detected, using fallback: ${firstSite.name}`);
-            } else {
-              console.error(`   ❌ WebSocket upgrade: No site detected and no fallback available`);
-              socket.destroy();
-              return;
+          // Fallback to first site
+          if (!targetSite?.neocore?.enabled) {
+            targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
+            if (targetSite) {
+              console.log(`   ⚠️  Using fallback: ${targetSite.name}`);
             }
           }
         }
-      }
-      
-      // Route to correct proxy based on rewritten URL
-      for (const [siteName, proxy] of socketProxies.entries()) {
-        if (url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
-          console.log(`   ✅ Routing WebSocket to: ${siteName} → ${allSites[siteName].neocore.target}/socket.io`);
-          try {
-            proxy.upgrade(req, socket, head);
-            return;
-          } catch (err) {
-            console.error(`   ❌ Error upgrading WebSocket for ${siteName}:`, err.message);
-            socket.destroy();
-            return;
-          }
+        
+        if (targetSite?.neocore?.enabled) {
+          // Rewrite URL - middleware will handle the upgrade automatically
+          const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
+          url = `/vpn/${targetSite.name}/neocore/socket.io${queryString}`;
+          req.url = url;
+          console.log(`   ✅ Rewritten to: ${url} → ${targetSite.name}`);
+        } else {
+          console.error(`   ❌ No site detected, closing connection`);
+          socket.destroy();
         }
       }
-      
-      // No match - close connection
-      console.error(`   ❌ WebSocket upgrade: No proxy found for ${url}`);
-      socket.destroy();
+      // Let the request continue - middleware will handle the upgrade for matching routes
     });
     
-    console.log(`✅ WebSocket upgrade handler registered for ${socketProxies.size} site(s)`);
+    console.log(`✅ WebSocket URL rewrite handler registered (middleware will handle upgrades)`);
   }
 
   // HTML route
