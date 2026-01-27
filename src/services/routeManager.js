@@ -167,14 +167,34 @@ function registerNeocoreRoutes(app, allSites, server) {
   // WebSocket upgrade handler - route upgrades to correct proxy
   if (server && socketProxies.size > 0) {
     server.on('upgrade', (req, socket, head) => {
-      const url = req.url || '';
+      let url = req.url || '';
+      
+      // If URL doesn't have site prefix, detect site from referer/origin and rewrite
+      if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
+        const site = detectSite(req, allSites);
+        if (site?.neocore?.enabled) {
+          // Rewrite URL to include site prefix
+          url = `/vpn/${site.name}/neocore/socket.io${url.substring(11)}`;
+          req.url = url;
+          console.log(`🔌 WebSocket upgrade: ${req.url} → ${site.name} (rewritten from referer)`);
+        } else {
+          console.error(`❌ WebSocket upgrade: No site detected for ${req.url}`);
+          socket.destroy();
+          return;
+        }
+      }
+      
+      // Route to correct proxy
       for (const [siteName, proxy] of socketProxies.entries()) {
         if (url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
+          console.log(`✅ WebSocket upgrade: ${url} → ${siteName}`);
           proxy.upgrade(req, socket, head);
           return;
         }
       }
+      
       // No match - close connection
+      console.error(`❌ WebSocket upgrade: No proxy found for ${url}`);
       socket.destroy();
     });
   }
