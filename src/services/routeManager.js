@@ -5,13 +5,12 @@
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const { createDevicesProxy } = require("./proxyFactory");
-const { createSession, getSiteFromSession } = require("./sessionManager");
 const { serveAsset, serveHTML } = require("./assetsService");
 
 /**
- * Register session, HTML, assets, and API routes
+ * Register HTML, assets, and API routes
  */
-function registerSessionRoutes(app, allSites) {
+function registerNeocoreRoutes(app, allSites) {
   // Serve HTML from build directory for neocore routes
   app.get('/vpn/:siteName/neocore', (req, res) => {
     const siteName = req.params.siteName;
@@ -21,35 +20,14 @@ function registerSessionRoutes(app, allSites) {
       return res.status(404).json({ error: 'Site not found' });
     }
     
-    // Create/validate session
-    let sessionId = req.cookies?.['vpn-session-id'];
-    if (!sessionId || getSiteFromSession(sessionId) !== siteName) {
-      sessionId = createSession(siteName);
-    }
-    
-    // Set session cookie
-    res.cookie('vpn-session-id', sessionId, {
-      httpOnly: true,
-      maxAge: 24 * 60 * 60 * 1000, // 24 hours
-      sameSite: 'lax'
-    });
-    
     // Serve HTML from build directory
     serveHTML(req, res, siteName);
   });
   
   // Assets serving endpoint - handle main.js and main.css
+  // Site is detected from referer header
   app.get(/^\/(main\.[^\/]+\.(js|css))$/, (req, res) => {
-    const sessionId = req.cookies?.['vpn-session-id'] || req.headers['x-session-id'];
-    
-    if (!sessionId) {
-      return res.status(401).json({ 
-        error: 'Session required',
-        message: 'Please access through /vpn/{site}/neocore first to create a session'
-      });
-    }
-    
-    serveAsset(req, res, sessionId);
+    serveAsset(req, res, allSites);
   });
   
   // Serve static assets (images, icons, etc.) from build directory
@@ -114,7 +92,7 @@ function registerSessionRoutes(app, allSites) {
     }
   });
   
-  console.log(`✅ Registered session, HTML, assets, and API routes`);
+  console.log(`✅ Registered HTML, assets, and API routes`);
 }
 
 /**
@@ -138,10 +116,10 @@ function registerSiteRoutes(app, site, allSites) {
  * Register all routes for all sites
  */
 function registerAllRoutes(app, sites) {
-  // Register session routes first (before site routes)
-  registerSessionRoutes(app, sites);
+  // Register neocore routes first (HTML, assets, API)
+  registerNeocoreRoutes(app, sites);
   
-  // Register site-specific routes
+  // Register site-specific routes (devices)
   Object.values(sites).forEach(site => {
     registerSiteRoutes(app, site, sites);
   });

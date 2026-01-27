@@ -1,18 +1,17 @@
 /**
  * Assets Service
- * Serves local assets and rewrites paths based on session/site
+ * Serves local assets and rewrites paths based on site detection from request
  */
 
 const fs = require('fs');
 const path = require('path');
-const { getSiteFromSession } = require('./sessionManager');
 
 const BUILD_DIR = path.join(__dirname, '../build');
 const ASSETS_DIR = path.join(BUILD_DIR, 'static');
 const JS_FILE = 'js/main.e1802fd1.js';
 const CSS_FILE = 'css/main.959413d2.css';
 
-// Cache for rewritten assets (sessionId -> { js: content, css: content })
+// Cache for rewritten assets (siteName -> { js: content, css: content })
 const assetCache = new Map();
 
 /**
@@ -85,17 +84,42 @@ function rewriteAssetContent(content, siteName, fileType) {
 }
 
 /**
- * Get asset content (with caching)
+ * Detect site from request (referer or URL)
  */
-function getAsset(sessionId, fileName) {
-  // Get site from session
-  const siteName = getSiteFromSession(sessionId);
+function detectSiteFromRequest(req, allSites) {
+  // Try to get site from referer
+  const referer = req.headers.referer || req.headers.origin || '';
+  const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
+  
+  if (siteMatch) {
+    const siteName = siteMatch[1];
+    if (allSites[siteName] && allSites[siteName].neocore?.enabled) {
+      return siteName;
+    }
+  }
+  
+  // Try to get from URL if direct request
+  const urlMatch = req.url.match(/\/vpn\/([^\/]+)\//);
+  if (urlMatch) {
+    const siteName = urlMatch[1];
+    if (allSites[siteName] && allSites[siteName].neocore?.enabled) {
+      return siteName;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Get asset content (with caching per site)
+ */
+function getAsset(siteName, fileName) {
   if (!siteName) {
-    throw new Error('Invalid or expired session');
+    throw new Error('Site not detected from request');
   }
   
   // Check cache
-  const cacheKey = `${sessionId}:${fileName}`;
+  const cacheKey = `${siteName}:${fileName}`;
   if (assetCache.has(cacheKey)) {
     return assetCache.get(cacheKey);
   }
@@ -116,7 +140,7 @@ function getAsset(sessionId, fileName) {
   content = rewriteAssetContent(content, siteName, fileType);
   
   // Cache (with size limit - optional)
-  if (assetCache.size < 100) { // Limit cache to 100 entries
+  if (assetCache.size < 200) { // Limit cache to 200 entries
     assetCache.set(cacheKey, content);
   }
   
@@ -126,8 +150,17 @@ function getAsset(sessionId, fileName) {
 /**
  * Serve asset file
  */
-function serveAsset(req, res, sessionId) {
+function serveAsset(req, res, allSites) {
   try {
+    // Detect site from request
+    const siteName = detectSiteFromRequest(req, allSites);
+    if (!siteName) {
+      return res.status(400).json({ 
+        error: 'Site not detected',
+        message: 'Please access through /vpn/{site}/neocore first'
+      });
+    }
+    
     const url = req.url;
     let fileName, contentType;
     
@@ -142,14 +175,14 @@ function serveAsset(req, res, sessionId) {
       return res.status(404).json({ error: 'Asset not found' });
     }
     
-    const content = getAsset(sessionId, fileName);
+    const content = getAsset(siteName, fileName);
     
     res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('X-Served-From', 'local-build');
     res.send(content);
     
-    console.log(`📦 Served asset: ${fileName} for session ${sessionId.substring(0, 8)}...`);
+    console.log(`📦 Served asset: ${fileName} for site: ${siteName}`);
   } catch (err) {
     console.error(`❌ Error serving asset:`, err.message);
     if (!res.headersSent) {
@@ -197,11 +230,11 @@ function serveHTML(req, res, siteName) {
 }
 
 /**
- * Clear cache for a session (optional)
+ * Clear cache for a site (optional)
  */
-function clearCacheForSession(sessionId) {
+function clearCacheForSite(siteName) {
   for (const key of assetCache.keys()) {
-    if (key.startsWith(sessionId)) {
+    if (key.startsWith(siteName + ':')) {
       assetCache.delete(key);
     }
   }
@@ -211,5 +244,6 @@ module.exports = {
   serveAsset,
   serveHTML,
   getAsset,
-  clearCacheForSession
+  detectSiteFromRequest,
+  clearCacheForSite
 };
