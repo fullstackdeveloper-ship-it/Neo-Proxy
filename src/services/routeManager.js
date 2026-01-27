@@ -5,6 +5,74 @@
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const { createNeocoreProxy, createDevicesProxy } = require("./proxyFactory");
+const { createSession, getSiteFromSession } = require("./sessionManager");
+const { serveAsset } = require("./assetsService");
+
+/**
+ * Register session and assets routes
+ */
+function registerSessionRoutes(app, allSites) {
+  // Session creation middleware for neocore routes
+  app.use('/vpn/:siteName/neocore', (req, res, next) => {
+    const siteName = req.params.siteName;
+    const site = allSites[siteName];
+    
+    if (!site || !site.neocore?.enabled) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Check if session already exists (from cookie)
+    let sessionId = req.cookies?.['vpn-session-id'];
+    
+    if (!sessionId || getSiteFromSession(sessionId) !== siteName) {
+      // Create new session
+      sessionId = createSession(siteName);
+    }
+    
+    // Set session cookie
+    res.cookie('vpn-session-id', sessionId, {
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+      sameSite: 'lax'
+    });
+    
+    // Store session in request for later use
+    req.sessionId = sessionId;
+    
+    // Continue to proxy
+    next();
+  });
+  
+  // Assets serving endpoint - handle main.js and main.css
+  app.get(/^\/(main\.[^\/]+\.(js|css))$/, (req, res) => {
+    const sessionId = req.cookies?.['vpn-session-id'] || req.headers['x-session-id'];
+    
+    if (!sessionId) {
+      return res.status(401).json({ 
+        error: 'Session required',
+        message: 'Please access through /vpn/{site}/neocore first to create a session'
+      });
+    }
+    
+    serveAsset(req, res, sessionId);
+  });
+  
+  // Also handle /assets/* path
+  app.get('/assets/:fileName', (req, res) => {
+    const sessionId = req.cookies?.['vpn-session-id'] || req.headers['x-session-id'];
+    
+    if (!sessionId) {
+      return res.status(401).json({ 
+        error: 'Session required',
+        message: 'Please access through /vpn/{site}/neocore first to create a session'
+      });
+    }
+    
+    serveAsset(req, res, sessionId);
+  });
+  
+  console.log(`✅ Registered session and assets routes`);
+}
 
 /**
  * Register routes for a single site
@@ -12,7 +80,7 @@ const { createNeocoreProxy, createDevicesProxy } = require("./proxyFactory");
 function registerSiteRoutes(app, site, allSites) {
   const sitePrefix = `/vpn/${site.name}`;
   
-  // Register neocore route
+  // Register neocore route (session middleware already applied above)
   if (site.neocore && site.neocore.enabled) {
     const neocoreProxy = createNeocoreProxy(site);
     if (neocoreProxy) {
@@ -154,10 +222,11 @@ function registerDirectRoutes(app, site, allSites) {
     directProxy(req, res, next);
   });
   
-  // Root-level routes with proper multi-site detection
+  // Root-level routes with proper multi-site detection (NO FALLBACK)
   // Create root proxy handler that reuses cached proxy instances
   const createRootProxy = () => {
     return (req, res, next) => {
+      // Try to detect site from referer or origin
       const referer = req.headers.referer || req.headers.origin || '';
       const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
       
@@ -173,16 +242,30 @@ function registerDirectRoutes(app, site, allSites) {
         }
       }
       
-      // If no referer, try first enabled site as fallback
-      const firstEnabledSite = Object.values(allSites).find(s => s.neocore?.enabled);
-      if (firstEnabledSite) {
-        trackDirectRequest(firstEnabledSite, req, `Root route (fallback: ${firstEnabledSite.name})`);
-        // Reuse cached proxy instance
-        const fallbackProxy = getRootProxyForSite(firstEnabledSite);
-        return fallbackProxy(req, res, next);
-      }
+      // NO FALLBACK - If site cannot be detected, return 404
+      // Client should use site-specific routes: /static/{site}/* or /api/{site}/*
+      console.warn(`⚠️  Root route request without site detection: ${req.method} ${req.url}`);
+      console.warn(`   Referer: ${referer || 'none'}`);
+      console.warn(`   Use site-specific route: /static/{site}/* or /api/{site}/*`);
       
-      next();
+      if (!res.headersSent && !res.writableEnded) {
+        try {
+          res.status(404).json({
+            error: "Site not detected",
+            message: "Cannot determine target site. Use site-specific routes: /static/{site}/* or /api/{site}/*",
+            availableSites: Object.values(allSites)
+              .filter(s => s.neocore?.enabled)
+              .map(s => ({
+                name: s.name,
+                routes: {
+                  static: `/static/${s.name}/*`,
+                  api: `/api/${s.name}/*`,
+                  neocore: `/vpn/${s.name}/neocore`
+                }
+              }))
+          });
+        } catch (e) {}
+      }
     };
   };
   
@@ -205,6 +288,10 @@ function registerDirectRoutes(app, site, allSites) {
  * Register all routes for all sites
  */
 function registerAllRoutes(app, sites) {
+  // Register session routes first (before site routes)
+  registerSessionRoutes(app, sites);
+  
+  // Register site-specific routes
   Object.values(sites).forEach(site => {
     registerSiteRoutes(app, site, sites);
   });

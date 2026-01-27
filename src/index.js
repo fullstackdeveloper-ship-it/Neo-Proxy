@@ -4,11 +4,15 @@
  */
 
 const express = require("express");
+const cookieParser = require("cookie-parser");
 const SITES = require("./config/sites");
 const { initializeTunnels, shutdownAllTunnels } = require("./services/tunnelManager");
 const { registerAllRoutes } = require("./services/routeManager");
 
 const app = express();
+
+// Cookie parser middleware (required for session management)
+app.use(cookieParser());
 
 // Request tracking middleware for all requests
 app.use((req, res, next) => {

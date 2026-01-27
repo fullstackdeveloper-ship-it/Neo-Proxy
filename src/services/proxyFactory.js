@@ -125,7 +125,10 @@ function createNeocoreProxy(site) {
 
       proxyRes.on("end", () => {
         try {
-          body = rewriteContent(body, site.name, req, 'neocore');
+          // Only rewrite HTML to point to local assets, skip JS/CSS (served separately)
+          if (contentType.includes("text/html")) {
+            body = rewriteContent(body, site.name, req, 'neocore');
+          }
           
           if (!res.headersSent && !res.writableEnded) {
             res.setHeader("content-type", contentType);
@@ -314,7 +317,8 @@ function createDevicesProxy(site) {
 }
 
 /**
- * Rewrite content paths for React apps
+ * Rewrite HTML content to point to local assets and correct API paths
+ * JS and CSS are now served separately via assetsService, so we only rewrite HTML
  */
 function rewriteContent(body, siteName, req, serviceType = 'neocore') {
   // Use full path including service type
@@ -322,71 +326,45 @@ function rewriteContent(body, siteName, req, serviceType = 'neocore') {
     ? `/vpn/${siteName}/neocore`
     : `/vpn/${siteName}/devices`;
     
-  const contentType = req.headers["content-type"] || "";
-  const isJS = contentType.includes("javascript");
-  const isHTML = contentType.includes("text/html");
-  const isCSS = contentType.includes("text/css");
-  
   // Track rewriting for debugging
-  if (process.env.DEBUG && (isJS || isHTML || isCSS)) {
-    console.log(`   🔄 Rewriting content for ${siteName}/${serviceType} (${contentType})`);
+  if (process.env.DEBUG) {
+    console.log(`   🔄 Rewriting HTML content for ${siteName}/${serviceType}`);
   }
   
-  if (isJS) {
-    // More aggressive JavaScript rewriting
-    body = body
-      .replace(/process\.env\.REACT_APP_API_URL\s*\|\|\s*["']([^"']+)["']/gi, 
-        `process.env.REACT_APP_API_URL || "${sitePrefix}$1"`)
-      .replace(/(fetch|axios|XMLHttpRequest)\(["'](\/[^"']+)["']/gi, 
-        (match, method, path) => {
-          // Rewrite all relative paths starting with /api or /static
-          if (path.startsWith('/api/') || path.startsWith('/static/') || 
-              path.startsWith('/fonts/') || /\.(png|svg|ico|jpg|jpeg|webp|gif|css|js)$/.test(path)) {
-            return `${method}("${sitePrefix}${path}")`;
-          }
-          return match;
-        })
-      .replace(/["'](\/api\/[^"']+)["']/gi, `"${sitePrefix}$1"`)
-      .replace(/["'](\/static\/[^"']+)["']/gi, `"${sitePrefix}$1"`)
-      .replace(/url:\s*["'](\/[^"']+)["']/gi, (match, path) => {
-        if (path.startsWith('/api/') || path.startsWith('/static/')) {
-          return `url: "${sitePrefix}${path}"`;
-        }
-        return match;
-      });
-  }
+  // Simplified rewriting - only for HTML:
+  // 1. Point JS/CSS assets to local assets endpoint (session-based)
+  // 2. Point API calls to correct site prefix
+  // 3. Point static assets to correct site prefix
   
-  // More aggressive HTML/JS/CSS rewriting - First pass: catch-all for absolute paths
-  if (isHTML || isJS) {
-    // Replace all absolute paths that start with / (but not /vpn/, http, https, //)
-    // This handles cases like /nslogo.png, /static/js/main.js, etc.
-    body = body.replace(/(["'])(\/(?!vpn\/|http|https|\/\/)[^"']+)\1/g, (match, quote, path) => {
-      // Skip if already has /vpn/ prefix
-      if (path.startsWith('/vpn/')) return match;
-      // Skip external URLs
-      if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('//')) return match;
-      // Rewrite all other absolute paths
-      return `${quote}${sitePrefix}${path}${quote}`;
-    });
-  }
-  
-  // Specific patterns for better coverage (second pass for edge cases)
   body = body
-    // Static assets - handle all quote types
-    .replace(/(src|href|action)=(["'])(\/static\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
-    .replace(/url\(\s*(["']?)(\/static\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
+    // Rewrite main.js and main.css to local assets endpoint
+    .replace(/(src|href)=(["'])(\/static\/js\/main\.[^"']+\.js)\2/gi, 
+      (match, attr, quote, path) => {
+        // Extract filename
+        const fileName = path.split('/').pop();
+        return `${attr}=${quote}/${fileName}${quote}`;
+      })
+    .replace(/(src|href)=(["'])(\/static\/css\/main\.[^"']+\.css)\2/gi, 
+      (match, attr, quote, path) => {
+        // Extract filename
+        const fileName = path.split('/').pop();
+        return `${attr}=${quote}/${fileName}${quote}`;
+      })
     
-    // API endpoints
-    .replace(/(fetch|axios|XMLHttpRequest)\(["'](\/api\/[^"']+)["']/gi, `$1("${sitePrefix}$2"`)
+    // API endpoints - point to correct site
     .replace(/(src|href|action)=(["'])(\/api\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
     
-    // Root assets (images, fonts, icons, CSS, JS) - handle with query strings
-    .replace(/(src|href)=(["'])(\/([^"?#\/]+\.(png|svg|ico|jpg|jpeg|webp|gif|woff|woff2|ttf|eot|otf|css|js))(\?[^"]*)?)\2/gi, 
-      `$1=$2${sitePrefix}$3$2`)
-    
-    // Font files in CSS
-    .replace(/url\(\s*(["']?)(\/fonts\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
-    .replace(/url\(\s*(["']?)(\/assets\/fonts\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
+    // Other static assets (images, fonts, etc.) - point to correct site
+    .replace(/(src|href)=(["'])(\/(?!vpn\/|http|https|\/\/|main\.)[^"']+)\2/gi, 
+      (match, attr, quote, path) => {
+        // Skip if already has /vpn/ prefix or external URL
+        if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+            path.startsWith('https://') || path.startsWith('//')) {
+          return match;
+        }
+        // Rewrite to site prefix
+        return `${attr}=${quote}${sitePrefix}${path}${quote}`;
+      })
     
     // WebSocket connections
     .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, `$1://${req.headers.host}${sitePrefix}$2`);
