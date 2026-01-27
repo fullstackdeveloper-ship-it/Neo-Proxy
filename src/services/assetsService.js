@@ -7,9 +7,10 @@ const fs = require('fs');
 const path = require('path');
 const { getSiteFromSession } = require('./sessionManager');
 
-const ASSETS_DIR = path.join(__dirname, '../assets');
-const JS_FILE = 'main.e1802fd1.js';
-const CSS_FILE = 'main.959413d2.css';
+const BUILD_DIR = path.join(__dirname, '../build');
+const ASSETS_DIR = path.join(BUILD_DIR, 'static');
+const JS_FILE = 'js/main.e1802fd1.js';
+const CSS_FILE = 'css/main.959413d2.css';
 
 // Cache for rewritten assets (sessionId -> { js: content, css: content })
 const assetCache = new Map();
@@ -99,14 +100,17 @@ function getAsset(sessionId, fileName) {
     return assetCache.get(cacheKey);
   }
   
-  // Read file
-  const filePath = path.join(ASSETS_DIR, fileName);
+  // Read file from build/static directory
+  const fileType = fileName.endsWith('.js') ? 'js' : 'css';
+  const filePath = fileType === 'js' 
+    ? path.join(ASSETS_DIR, JS_FILE)
+    : path.join(ASSETS_DIR, CSS_FILE);
+    
   if (!fs.existsSync(filePath)) {
-    throw new Error(`Asset not found: ${fileName}`);
+    throw new Error(`Asset not found: ${filePath}`);
   }
   
   let content = fs.readFileSync(filePath, 'utf8');
-  const fileType = fileName.endsWith('.js') ? 'js' : 'css';
   
   // Rewrite paths based on site
   content = rewriteAssetContent(content, siteName, fileType);
@@ -127,12 +131,12 @@ function serveAsset(req, res, sessionId) {
     const url = req.url;
     let fileName, contentType;
     
-    // Determine file from URL
-    if (url.includes(JS_FILE) || url.endsWith('.js')) {
-      fileName = JS_FILE;
+    // Determine file from URL (handle both /main.*.js and /static/js/main.*.js)
+    if (url.includes('main.') && url.endsWith('.js')) {
+      fileName = 'main.e1802fd1.js';
       contentType = 'application/javascript';
-    } else if (url.includes(CSS_FILE) || url.endsWith('.css')) {
-      fileName = CSS_FILE;
+    } else if (url.includes('main.') && url.endsWith('.css')) {
+      fileName = 'main.959413d2.css';
       contentType = 'text/css';
     } else {
       return res.status(404).json({ error: 'Asset not found' });
@@ -142,12 +146,50 @@ function serveAsset(req, res, sessionId) {
     
     res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.setHeader('X-Served-From', 'local-assets');
+    res.setHeader('X-Served-From', 'local-build');
     res.send(content);
     
     console.log(`📦 Served asset: ${fileName} for session ${sessionId.substring(0, 8)}...`);
   } catch (err) {
     console.error(`❌ Error serving asset:`, err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+}
+
+/**
+ * Serve HTML from build directory
+ */
+function serveHTML(req, res, siteName) {
+  try {
+    const htmlPath = path.join(BUILD_DIR, 'index.html');
+    
+    if (!fs.existsSync(htmlPath)) {
+      return res.status(404).json({ error: 'Frontend build not found' });
+    }
+    
+    let html = fs.readFileSync(htmlPath, 'utf8');
+    const sitePrefix = `/vpn/${siteName}/neocore`;
+    
+    // Rewrite asset paths in HTML
+    html = html
+      // Rewrite JS: /static/js/main.js -> /main.e1802fd1.js (local asset)
+      .replace(/src="\/static\/js\/(main\.[^"]+\.js)"/g, 
+        `src="/$1"`)
+      // Rewrite CSS: /static/css/main.css -> /main.959413d2.css (local asset)
+      .replace(/href="\/static\/css\/(main\.[^"]+\.css)"/g, 
+        `href="/$1"`)
+      // Rewrite other assets (images, icons) to use site prefix for backend
+      .replace(/(src|href)="\/([^"]+\.(png|svg|ico|jpg|jpeg|webp|gif))"/g, 
+        `$1="${sitePrefix}/$2"`);
+    
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
+    
+    console.log(`📄 Served HTML for site: ${siteName}`);
+  } catch (err) {
+    console.error(`❌ Error serving HTML:`, err.message);
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
     }
@@ -167,6 +209,7 @@ function clearCacheForSession(sessionId) {
 
 module.exports = {
   serveAsset,
+  serveHTML,
   getAsset,
   clearCacheForSession
 };
