@@ -318,7 +318,8 @@ function createDevicesProxy(site) {
 
 /**
  * Rewrite HTML content to point to local assets and correct API paths
- * JS and CSS are now served separately via assetsService, so we only rewrite HTML
+ * For devices: Rewrites all relative paths to include site prefix
+ * For neocore: Rewrites main.js/css and API paths
  */
 function rewriteContent(body, siteName, req, serviceType = 'neocore') {
   // Use full path including service type
@@ -331,43 +332,111 @@ function rewriteContent(body, siteName, req, serviceType = 'neocore') {
     console.log(`   🔄 Rewriting HTML content for ${siteName}/${serviceType}`);
   }
   
-  // Simplified rewriting - only for HTML:
-  // 1. Point JS/CSS assets to local assets endpoint (session-based)
-  // 2. Point API calls to correct site prefix
-  // 3. Point static assets to correct site prefix
-  
-  body = body
-    // Rewrite main.js and main.css to local assets endpoint
-    .replace(/(src|href)=(["'])(\/static\/js\/main\.[^"']+\.js)\2/gi, 
-      (match, attr, quote, path) => {
-        // Extract filename
-        const fileName = path.split('/').pop();
-        return `${attr}=${quote}/${fileName}${quote}`;
-      })
-    .replace(/(src|href)=(["'])(\/static\/css\/main\.[^"']+\.css)\2/gi, 
-      (match, attr, quote, path) => {
-        // Extract filename
-        const fileName = path.split('/').pop();
-        return `${attr}=${quote}/${fileName}${quote}`;
-      })
+  if (serviceType === 'devices') {
+    // DEVICE-SPECIFIC REWRITING - Comprehensive path rewriting for device HTML
+    // Rewrite all relative paths to include /vpn/site/devices prefix
     
-    // API endpoints - point to correct site
-    .replace(/(src|href|action)=(["'])(\/api\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
+    body = body
+      // 1. Rewrite relative hrefs (links, CSS) - matches href="file.ext" or href='file.ext'
+      .replace(/(href)=(["'])(?!http|https|\/\/|#|javascript:|vpn\/)([^"']+)\2/gi,
+        (match, attr, quote, path) => {
+          // Skip if already absolute or special protocol
+          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+              path.startsWith('https://') || path.startsWith('//') ||
+              path.startsWith('#') || path.startsWith('javascript:')) {
+            return match;
+          }
+          // Make path absolute if relative
+          const absolutePath = path.startsWith('/') ? path : `/${path}`;
+          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+        })
+      
+      // 2. Rewrite relative srcs (images, scripts, iframes) - matches src="file.ext" or src='file.ext'
+      .replace(/(src)=(["'])(?!http|https|\/\/|data:|javascript:|vpn\/)([^"']+)\2/gi,
+        (match, attr, quote, path) => {
+          // Skip if already absolute or special protocol
+          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+              path.startsWith('https://') || path.startsWith('//') ||
+              path.startsWith('data:') || path.startsWith('javascript:')) {
+            return match;
+          }
+          // Make path absolute if relative
+          const absolutePath = path.startsWith('/') ? path : `/${path}`;
+          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+        })
+      
+      // 3. Rewrite form actions - matches action="file.ext" or action='file.ext'
+      .replace(/(action)=(["'])(?!http|https|\/\/|javascript:|vpn\/)([^"']+)\2/gi,
+        (match, attr, quote, path) => {
+          // Skip if already absolute or special protocol
+          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+              path.startsWith('https://') || path.startsWith('//') ||
+              path.startsWith('javascript:')) {
+            return match;
+          }
+          // Make path absolute if relative
+          const absolutePath = path.startsWith('/') ? path : `/${path}`;
+          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+        })
+      
+      // 4. Rewrite iframe src attributes specifically
+      .replace(/(<iframe[^>]*\ssrc)=(["'])(?!http|https|\/\/|data:|vpn\/)([^"']+)\2/gi,
+        (match, attr, quote, path) => {
+          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+              path.startsWith('https://') || path.startsWith('//') ||
+              path.startsWith('data:')) {
+            return match;
+          }
+          const absolutePath = path.startsWith('/') ? path : `/${path}`;
+          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+        })
+      
+      // 5. Rewrite WebSocket connections in JavaScript
+      .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, 
+        `$1://${req.headers.host}${sitePrefix}$2`)
+      
+      // 6. Rewrite fetch/XMLHttpRequest URLs in JavaScript (basic pattern)
+      .replace(/(fetch|XMLHttpRequest|open)\s*\(["']([^"']+)["']/gi,
+        (match, method, url) => {
+          if (url.startsWith('/vpn/') || url.startsWith('http://') || 
+              url.startsWith('https://') || url.startsWith('//')) {
+            return match;
+          }
+          const absoluteUrl = url.startsWith('/') ? url : `/${url}`;
+          return `${method}("${sitePrefix}${absoluteUrl}"`;
+        });
     
-    // Other static assets (images, fonts, etc.) - point to correct site
-    .replace(/(src|href)=(["'])(\/(?!vpn\/|http|https|\/\/|main\.)[^"']+)\2/gi, 
-      (match, attr, quote, path) => {
-        // Skip if already has /vpn/ prefix or external URL
-        if (path.startsWith('/vpn/') || path.startsWith('http://') || 
-            path.startsWith('https://') || path.startsWith('//')) {
-          return match;
-        }
-        // Rewrite to site prefix
-        return `${attr}=${quote}${sitePrefix}${path}${quote}`;
-      })
-    
-    // WebSocket connections
-    .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, `$1://${req.headers.host}${sitePrefix}$2`);
+  } else {
+    // NEOCORE-SPECIFIC REWRITING - Simplified for React app
+    body = body
+      // Rewrite main.js and main.css to local assets endpoint
+      .replace(/(src|href)=(["'])(\/static\/js\/main\.[^"']+\.js)\2/gi, 
+        (match, attr, quote, path) => {
+          const fileName = path.split('/').pop();
+          return `${attr}=${quote}/${fileName}${quote}`;
+        })
+      .replace(/(src|href)=(["'])(\/static\/css\/main\.[^"']+\.css)\2/gi, 
+        (match, attr, quote, path) => {
+          const fileName = path.split('/').pop();
+          return `${attr}=${quote}/${fileName}${quote}`;
+        })
+      
+      // API endpoints - point to correct site
+      .replace(/(src|href|action)=(["'])(\/api\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
+      
+      // Other static assets (images, fonts, etc.) - point to correct site
+      .replace(/(src|href)=(["'])(\/(?!vpn\/|http|https|\/\/|main\.)[^"']+)\2/gi, 
+        (match, attr, quote, path) => {
+          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
+              path.startsWith('https://') || path.startsWith('//')) {
+            return match;
+          }
+          return `${attr}=${quote}${sitePrefix}${path}${quote}`;
+        })
+      
+      // WebSocket connections
+      .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, `$1://${req.headers.host}${sitePrefix}$2`);
+  }
   
   return body;
 }
