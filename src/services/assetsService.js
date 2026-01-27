@@ -23,27 +23,51 @@ function rewriteAssetContent(content, siteName, fileType) {
   if (fileType === 'js') {
     // Rewrite API calls, static paths, etc.
     content = content
-      // API endpoints
+      // 1. BASE_URL constant: BASE_URL: "/api" -> BASE_URL: "/vpn/{site}/neocore/api"
+      .replace(/(BASE_URL|baseURL|baseUrl|base_url)\s*:\s*["'](\/api)["']/gi, 
+        `$1: "${sitePrefix}$2"`)
+      
+      // 2. this.request method: "".concat("/api").concat(e) -> "".concat("/vpn/{site}/neocore/api").concat(e)
+      .replace(/(""\.concat\(")(\/api)("\)\.concat\()/g, 
+        (match, prefix, apiPath, suffix) => {
+          return prefix + sitePrefix + apiPath + suffix;
+        })
+      
+      // 3. fetch with concat: fetch("".concat("/api", "/path")) -> fetch("".concat("/vpn/{site}/neocore/api", "/path"))
+      .replace(/(fetch|axios|XMLHttpRequest)\(["']\.concat\(["'](\/api)(["'],\s*["'])/g, 
+        (match, method, apiPath, rest) => {
+          return method + '("".concat("' + sitePrefix + apiPath + '"' + rest;
+        })
+      
+      // 4. Direct API endpoints in strings: "/api/health" -> "/vpn/{site}/neocore/api/health"
       .replace(/["'](\/api\/[^"']+)["']/g, `"${sitePrefix}$1"`)
-      // Static assets
+      
+      // 5. Static assets: "/static/js/main.js" -> "/vpn/{site}/neocore/static/js/main.js"
       .replace(/["'](\/static\/[^"']+)["']/g, `"${sitePrefix}$1"`)
-      // Fetch/Axios calls
+      
+      // 6. Fetch/Axios calls with direct paths
       .replace(/(fetch|axios|XMLHttpRequest)\(["'](\/[^"']+)["']/g, (match, method, urlPath) => {
         if (urlPath.startsWith('/api/') || urlPath.startsWith('/static/')) {
           return `${method}("${sitePrefix}${urlPath}")`;
         }
         return match;
       })
-      // URL objects
+      
+      // 7. URL objects in config
       .replace(/url:\s*["'](\/[^"']+)["']/g, (match, urlPath) => {
         if (urlPath.startsWith('/api/') || urlPath.startsWith('/static/')) {
           return `url: "${sitePrefix}${urlPath}"`;
         }
         return match;
       })
-      // Root assets (images, etc.)
+      
+      // 8. Root assets (images, fonts, etc.)
       .replace(/["'](\/([^"?#\/]+\.(png|svg|ico|jpg|jpeg|webp|gif|woff|woff2|ttf|eot|otf)))(\?[^"]*)?["']/g, 
-        `"${sitePrefix}$1$4"`);
+        (match, path, filename, ext, query) => {
+          // Skip if already has /vpn/ prefix
+          if (path.startsWith('/vpn/')) return match;
+          return `"${sitePrefix}${path}${query || ''}"`;
+        });
   } else if (fileType === 'css') {
     // Rewrite CSS URLs
     content = content
