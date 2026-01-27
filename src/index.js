@@ -4,12 +4,14 @@
  */
 
 const express = require("express");
+const http = require("http");
 const cookieParser = require("cookie-parser");
 const SITES = require("./config/sites");
 const { initializeTunnels, shutdownAllTunnels } = require("./services/tunnelManager");
 const { registerAllRoutes } = require("./services/routeManager");
 
 const app = express();
+const server = http.createServer(app);
 
 // Cookie parser middleware (required for session management)
 app.use(cookieParser());
@@ -51,9 +53,8 @@ app.get("/health", (req, res) => {
 
 /* =========================
    REGISTER ALL ROUTES
+   (Routes will be registered after server is created)
 ========================= */
-
-registerAllRoutes(app, SITES);
 
 /* =========================
    GRACEFUL SHUTDOWN
@@ -81,13 +82,17 @@ const HOST = process.env.HOST || "0.0.0.0";
 // Initialize SOCKS tunnels for all sites
 initializeTunnels(SITES);
 
-app.listen(PORT, HOST, () => {
+// Register routes (this must be called before server.listen)
+registerAllRoutes(app, SITES, server);
+
+server.listen(PORT, HOST, () => {
   console.log(`\n✅ VPN Proxy Service running → http://${HOST}:${PORT}`);
   console.log(`\n📋 Available Sites:`);
   Object.values(SITES).forEach(s => {
     console.log(`\n   🏢 Site: ${s.name} (VPN: ${s.vpnIp})`);
     if (s.neocore?.enabled) {
       console.log(`      🌐 /vpn/${s.name}/neocore → ${s.neocore.target}`);
+      console.log(`      🔌 Socket.io: /vpn/${s.name}/neocore/socket.io → ${s.neocore.target}/socket.io`);
     }
     if (s.devices?.enabled) {
       console.log(`      🔧 /vpn/${s.name}/devices → ${s.devices.target} (SOCKS:${s.devices.socksPort})`);

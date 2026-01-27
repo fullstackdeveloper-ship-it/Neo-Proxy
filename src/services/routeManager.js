@@ -10,7 +10,7 @@ const { serveAsset, serveHTML } = require("./assetsService");
 /**
  * Register HTML, assets, and API routes
  */
-function registerNeocoreRoutes(app, allSites) {
+function registerNeocoreRoutes(app, allSites, server) {
   // Socket.io interceptor - detects site from URL path or referer
   // Socket.io uses /socket.io/ path, not /api/socket.io/
   app.use((req, res, next) => {
@@ -35,10 +35,15 @@ function registerNeocoreRoutes(app, allSites) {
         if (site && site.neocore?.enabled) {
           // If URL already has site prefix, keep it; otherwise add it
           if (!req.url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
+            const originalUrl = req.url;
             req.url = `/vpn/${siteName}/neocore/socket.io${req.url.substring(11)}`; // Remove '/socket.io' prefix
-            console.log(`🔄 Socket.io rewrite: ${req.originalUrl} → ${req.url} (site: ${siteName})`);
+            console.log(`🔄 Socket.io rewrite: ${originalUrl} → ${req.url} (site: ${siteName})`);
           }
+        } else {
+          console.log(`⚠️  Socket.io request for unknown/disabled site: ${siteName}`);
         }
+      } else {
+        console.log(`⚠️  Socket.io request without site detection: ${req.url} (referer: ${req.headers.referer || 'none'})`);
       }
     }
     
@@ -197,6 +202,8 @@ function registerNeocoreRoutes(app, allSites) {
   
   // Socket.io proxy routes - handle WebSocket connections (MUST be before API routes)
   // Socket.io uses /socket.io/ path, not /api/socket.io/
+  const socketProxies = new Map(); // Store proxies for upgrade handler
+  
   Object.values(allSites).forEach(site => {
     if (site.neocore && site.neocore.enabled) {
       const socketProxy = createProxyMiddleware({
@@ -225,13 +232,39 @@ function registerNeocoreRoutes(app, allSites) {
               res.status(502).json({ error: "Socket.io proxy error", message: err.message });
             } catch (e) {}
           }
+        },
+        onProxyReqWs: (proxyReq, req, socket) => {
+          console.log(`🔌 WebSocket upgrade: ${site.name} → ${site.neocore.target}/socket.io`);
         }
       });
       
+      // Store proxy for this site
+      socketProxies.set(site.name, socketProxy);
+      
+      // Register for HTTP requests
       app.use(`/vpn/${site.name}/neocore/socket.io`, socketProxy);
+      
       console.log(`✅ Registered Socket.io proxy: /vpn/${site.name}/neocore/socket.io → ${site.neocore.target}/socket.io`);
     }
   });
+  
+  // Single upgrade handler for all socket.io WebSocket connections
+  if (server && socketProxies.size > 0) {
+    server.on('upgrade', (req, socket, head) => {
+      const url = req.url || '';
+      
+      // Check if it's a socket.io request for any site
+      for (const [siteName, proxy] of socketProxies.entries()) {
+        if (url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
+          console.log(`🔌 WebSocket upgrade: ${url} (site: ${siteName})`);
+          proxy.upgrade(req, socket, head);
+          return;
+        }
+      }
+      
+      // If no socket.io proxy matches, let it fall through to other handlers
+    });
+  }
   
   // API proxy routes - proxy API calls to neocore backend (MUST be before catch-all)
   Object.values(allSites).forEach(site => {
@@ -317,9 +350,9 @@ function registerSiteRoutes(app, site, allSites) {
 /**
  * Register all routes for all sites
  */
-function registerAllRoutes(app, sites) {
+function registerAllRoutes(app, sites, server) {
   // Register neocore routes first (HTML, assets, API)
-  registerNeocoreRoutes(app, sites);
+  registerNeocoreRoutes(app, sites, server);
   
   // Register site-specific routes (devices)
   Object.values(sites).forEach(site => {
