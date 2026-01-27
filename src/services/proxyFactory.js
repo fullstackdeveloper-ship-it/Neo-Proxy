@@ -279,7 +279,13 @@ function createDevicesProxy(site) {
 
       proxyRes.on("end", () => {
         try {
+          const originalLength = body.length;
           body = rewriteContent(body, site.name, req, 'devices');
+          const newLength = body.length;
+          
+          if (process.env.DEBUG || originalLength !== newLength) {
+            console.log(`   📝 Device content rewritten: ${originalLength} → ${newLength} bytes`);
+          }
           
           if (!res.headersSent && !res.writableEnded) {
             res.setHeader("content-type", contentType);
@@ -290,9 +296,10 @@ function createDevicesProxy(site) {
         } catch (err) {
           trackRequest(site, 'devices', req, 'error');
           console.error(`❌ Error rewriting content (${site.name}/devices):`, err.message);
+          console.error(`   Stack:`, err.stack);
           if (!res.headersSent && !res.writableEnded) {
             try {
-              res.status(500).json({ error: "Content processing error" });
+              res.status(500).json({ error: "Content processing error", message: err.message });
             } catch (e) {}
           }
         }
@@ -336,75 +343,106 @@ function rewriteContent(body, siteName, req, serviceType = 'neocore') {
     // DEVICE-SPECIFIC REWRITING - Comprehensive path rewriting for device HTML
     // Rewrite all relative paths to include /vpn/site/devices prefix
     
+    console.log(`   🔄 Rewriting device HTML for ${siteName} (prefix: ${sitePrefix})`);
+    
+    // Helper function to check if path should be skipped
+    const shouldSkip = (path) => {
+      return path.startsWith('/vpn/') || 
+             path.startsWith('http://') || 
+             path.startsWith('https://') || 
+             path.startsWith('//') ||
+             path.startsWith('data:') ||
+             path.startsWith('javascript:') ||
+             path.startsWith('mailto:') ||
+             path.startsWith('#') ||
+             path.trim() === '';
+    };
+    
+    // Helper function to make path absolute
+    const makeAbsolute = (path) => {
+      return path.startsWith('/') ? path : `/${path}`;
+    };
+    
     body = body
-      // 1. Rewrite relative hrefs (links, CSS) - matches href="file.ext" or href='file.ext'
-      .replace(/(href)=(["'])(?!http|https|\/\/|#|javascript:|vpn\/)([^"']+)\2/gi,
+      // 1. Rewrite href attributes (links, CSS, etc.) - more comprehensive pattern
+      .replace(/(href)\s*=\s*(["'])([^"']+)\2/gi,
         (match, attr, quote, path) => {
-          // Skip if already absolute or special protocol
-          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
-              path.startsWith('https://') || path.startsWith('//') ||
-              path.startsWith('#') || path.startsWith('javascript:')) {
+          if (shouldSkip(path)) {
             return match;
           }
-          // Make path absolute if relative
-          const absolutePath = path.startsWith('/') ? path : `/${path}`;
-          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          const absolutePath = makeAbsolute(path);
+          const rewritten = `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          if (process.env.DEBUG) {
+            console.log(`      href: ${path} → ${sitePrefix}${absolutePath}`);
+          }
+          return rewritten;
         })
       
-      // 2. Rewrite relative srcs (images, scripts, iframes) - matches src="file.ext" or src='file.ext'
-      .replace(/(src)=(["'])(?!http|https|\/\/|data:|javascript:|vpn\/)([^"']+)\2/gi,
+      // 2. Rewrite src attributes (images, scripts, iframes) - more comprehensive pattern
+      .replace(/(src)\s*=\s*(["'])([^"']+)\2/gi,
         (match, attr, quote, path) => {
-          // Skip if already absolute or special protocol
-          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
-              path.startsWith('https://') || path.startsWith('//') ||
-              path.startsWith('data:') || path.startsWith('javascript:')) {
+          if (shouldSkip(path)) {
             return match;
           }
-          // Make path absolute if relative
-          const absolutePath = path.startsWith('/') ? path : `/${path}`;
-          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          const absolutePath = makeAbsolute(path);
+          const rewritten = `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          if (process.env.DEBUG) {
+            console.log(`      src: ${path} → ${sitePrefix}${absolutePath}`);
+          }
+          return rewritten;
         })
       
-      // 3. Rewrite form actions - matches action="file.ext" or action='file.ext'
-      .replace(/(action)=(["'])(?!http|https|\/\/|javascript:|vpn\/)([^"']+)\2/gi,
+      // 3. Rewrite form action attributes
+      .replace(/(action)\s*=\s*(["'])([^"']+)\2/gi,
         (match, attr, quote, path) => {
-          // Skip if already absolute or special protocol
-          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
-              path.startsWith('https://') || path.startsWith('//') ||
-              path.startsWith('javascript:')) {
+          if (shouldSkip(path)) {
             return match;
           }
-          // Make path absolute if relative
-          const absolutePath = path.startsWith('/') ? path : `/${path}`;
-          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          const absolutePath = makeAbsolute(path);
+          const rewritten = `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          if (process.env.DEBUG) {
+            console.log(`      action: ${path} → ${sitePrefix}${absolutePath}`);
+          }
+          return rewritten;
         })
       
-      // 4. Rewrite iframe src attributes specifically
-      .replace(/(<iframe[^>]*\ssrc)=(["'])(?!http|https|\/\/|data:|vpn\/)([^"']+)\2/gi,
-        (match, attr, quote, path) => {
-          if (path.startsWith('/vpn/') || path.startsWith('http://') || 
-              path.startsWith('https://') || path.startsWith('//') ||
-              path.startsWith('data:')) {
+      // 4. Rewrite background-image in style attributes
+      .replace(/(style\s*=\s*["'][^"']*url\s*\(\s*)(["']?)([^"')]+)(\s*\))/gi,
+        (match, prefix, quote, path, suffix) => {
+          if (shouldSkip(path)) {
             return match;
           }
-          const absolutePath = path.startsWith('/') ? path : `/${path}`;
-          return `${attr}=${quote}${sitePrefix}${absolutePath}${quote}`;
+          const absolutePath = makeAbsolute(path);
+          return `${prefix}${quote}${sitePrefix}${absolutePath}${quote}${suffix}`;
         })
       
       // 5. Rewrite WebSocket connections in JavaScript
       .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, 
-        `$1://${req.headers.host}${sitePrefix}$2`)
+        (match, protocol, path) => {
+          return `${protocol}://${req.headers.host}${sitePrefix}${path}`;
+        })
       
-      // 6. Rewrite fetch/XMLHttpRequest URLs in JavaScript (basic pattern)
-      .replace(/(fetch|XMLHttpRequest|open)\s*\(["']([^"']+)["']/gi,
-        (match, method, url) => {
-          if (url.startsWith('/vpn/') || url.startsWith('http://') || 
-              url.startsWith('https://') || url.startsWith('//')) {
+      // 6. Rewrite JavaScript fetch/XMLHttpRequest URLs (improved pattern)
+      .replace(/(fetch|\.open)\s*\(\s*(["'])([^"']+)\2/gi,
+        (match, method, quote, url) => {
+          if (shouldSkip(url)) {
             return match;
           }
-          const absoluteUrl = url.startsWith('/') ? url : `/${url}`;
-          return `${method}("${sitePrefix}${absoluteUrl}"`;
+          const absoluteUrl = makeAbsolute(url);
+          return `${method}(${quote}${sitePrefix}${absoluteUrl}${quote}`;
+        })
+      
+      // 7. Rewrite window.location assignments
+      .replace(/(window\.location\s*=\s*)(["'])([^"']+)\2/gi,
+        (match, prefix, quote, url) => {
+          if (shouldSkip(url)) {
+            return match;
+          }
+          const absoluteUrl = makeAbsolute(url);
+          return `${prefix}${quote}${sitePrefix}${absoluteUrl}${quote}`;
         });
+    
+    console.log(`   ✅ Device HTML rewriting complete for ${siteName}`);
     
   } else {
     // NEOCORE-SPECIFIC REWRITING - Simplified for React app
