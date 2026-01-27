@@ -139,22 +139,7 @@ function registerNeocoreRoutes(app, allSites) {
     }
   });
   
-  // Catch-all route for React Router client-side navigation (MUST be last)
-  // This handles routes like /vpn/site1/neocore/overview, /vpn/site1/neocore/logs, etc.
-  // Must be after all specific routes to avoid catching asset requests
-  app.get('/vpn/:siteName/neocore/*', (req, res) => {
-    const siteName = req.params.siteName;
-    const site = allSites[siteName];
-    
-    if (!site || !site.neocore?.enabled) {
-      return res.status(404).json({ error: 'Site not found' });
-    }
-    
-    // Serve HTML with base tag injection (React Router will handle the routing)
-    serveHTML(req, res, siteName);
-  });
-  
-  // API proxy routes - proxy API calls to neocore backend
+  // API proxy routes - proxy API calls to neocore backend (MUST be before catch-all)
   Object.values(allSites).forEach(site => {
     if (site.neocore && site.neocore.enabled) {
       const apiProxy = createProxyMiddleware({
@@ -188,6 +173,26 @@ function registerNeocoreRoutes(app, allSites) {
       app.use(`/vpn/${site.name}/neocore/api`, apiProxy);
       console.log(`✅ Registered API proxy: /vpn/${site.name}/neocore/api → ${site.neocore.target}/api`);
     }
+  });
+  
+  // Catch-all route for React Router client-side navigation (MUST be last)
+  // This handles routes like /vpn/site1/neocore/overview, /vpn/site1/neocore/logs, etc.
+  // Must be after all specific routes to avoid catching asset and API requests
+  app.get('/vpn/:siteName/neocore/*', (req, res) => {
+    const siteName = req.params.siteName;
+    const site = allSites[siteName];
+    
+    if (!site || !site.neocore?.enabled) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Skip API requests (should be handled by API proxy above)
+    if (req.url.includes('/api')) {
+      return res.status(404).json({ error: 'API route not found' });
+    }
+    
+    // Serve HTML with base tag injection (React Router will handle the routing)
+    serveHTML(req, res, siteName);
   });
   
   console.log(`✅ Registered HTML, assets, and API routes`);
