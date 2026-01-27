@@ -82,7 +82,7 @@ function createNeocoreProxy(site) {
 
       proxyRes.on("end", () => {
         try {
-          body = rewriteContent(body, site.name, req);
+          body = rewriteContent(body, site.name, req, 'neocore');
           
           if (!res.headersSent && !res.writableEnded) {
             res.setHeader("content-type", contentType);
@@ -200,7 +200,7 @@ function createDevicesProxy(site) {
 
       proxyRes.on("end", () => {
         try {
-          body = rewriteContent(body, site.name, req);
+          body = rewriteContent(body, site.name, req, 'devices');
           
           if (!res.headersSent && !res.writableEnded) {
             res.setHeader("content-type", contentType);
@@ -225,33 +225,70 @@ function createDevicesProxy(site) {
 /**
  * Rewrite content paths for React apps
  */
-function rewriteContent(body, siteName, req) {
-  const sitePrefix = `/vpn/${siteName}`;
+function rewriteContent(body, siteName, req, serviceType = 'neocore') {
+  // Use full path including service type
+  const sitePrefix = serviceType === 'neocore' 
+    ? `/vpn/${siteName}/neocore`
+    : `/vpn/${siteName}/devices`;
+    
   const contentType = req.headers["content-type"] || "";
   const isJS = contentType.includes("javascript");
+  const isHTML = contentType.includes("text/html");
   
   if (isJS) {
-    // Rewrite JavaScript files
+    // More aggressive JavaScript rewriting
     body = body
       .replace(/process\.env\.REACT_APP_API_URL\s*\|\|\s*["']([^"']+)["']/gi, 
         `process.env.REACT_APP_API_URL || "${sitePrefix}$1"`)
-      .replace(/(fetch|axios)\(["'](\/[^"']+)["']/gi, 
+      .replace(/(fetch|axios|XMLHttpRequest)\(["'](\/[^"']+)["']/gi, 
         (match, method, path) => {
-          if (path.startsWith('/api/') || path.startsWith('/static/')) {
+          // Rewrite all relative paths starting with /api or /static
+          if (path.startsWith('/api/') || path.startsWith('/static/') || 
+              path.startsWith('/fonts/') || /\.(png|svg|ico|jpg|jpeg|webp|gif|css|js)$/.test(path)) {
             return `${method}("${sitePrefix}${path}")`;
           }
           return match;
-        });
+        })
+      .replace(/["'](\/api\/[^"']+)["']/gi, `"${sitePrefix}$1"`)
+      .replace(/["'](\/static\/[^"']+)["']/gi, `"${sitePrefix}$1"`)
+      .replace(/url:\s*["'](\/[^"']+)["']/gi, (match, path) => {
+        if (path.startsWith('/api/') || path.startsWith('/static/')) {
+          return `url: "${sitePrefix}${path}"`;
+        }
+        return match;
+      });
   }
   
-  // Common rewrites
+  // Comprehensive HTML/JS/CSS rewriting
   body = body
+    // Static assets - handle all quote types
     .replace(/(src|href|action)=(["'])(\/static\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
     .replace(/url\(\s*(["']?)(\/static\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
-    .replace(/(fetch|axios)\(["'](\/api\/[^"']+)["']/gi, `$1("${sitePrefix}$2"`)
+    
+    // API endpoints
+    .replace(/(fetch|axios|XMLHttpRequest)\(["'](\/api\/[^"']+)["']/gi, `$1("${sitePrefix}$2"`)
+    .replace(/(src|href|action)=(["'])(\/api\/[^"']+)\2/gi, `$1=$2${sitePrefix}$3$2`)
+    
+    // Root assets (images, fonts, icons, CSS, JS) - must be before catch-all
     .replace(/(src|href)=(["'])(\/([^"?#\/]+\.(png|svg|ico|jpg|jpeg|webp|gif|woff|woff2|ttf|eot|otf|css|js))(\?[^"]*)?)\2/gi, 
       `$1=$2${sitePrefix}$3$2`)
-    .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, `$1://${req.headers.host}${sitePrefix}$2`);
+    
+    // Font files in CSS
+    .replace(/url\(\s*(["']?)(\/fonts\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
+    .replace(/url\(\s*(["']?)(\/assets\/fonts\/[^"')]+)\1\s*\)/gi, `url(${sitePrefix}$2)`)
+    
+    // WebSocket connections
+    .replace(/(ws|wss):\/\/[^/]+(\/[^"'\s)]+)/g, `$1://${req.headers.host}${sitePrefix}$2`)
+    
+    // Catch-all for any absolute path (but not external URLs or already prefixed)
+    .replace(/(src|href|action)=(["'])(\/(?!vpn\/|http|https|\/\/)[^"']+)\2/gi, 
+      (match, attr, quote, path) => {
+        // Skip if already has /vpn/ prefix
+        if (path.startsWith('/vpn/')) return match;
+        // Skip external URLs
+        if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('//')) return match;
+        return `${attr}=${quote}${sitePrefix}${path}${quote}`;
+      });
   
   return body;
 }

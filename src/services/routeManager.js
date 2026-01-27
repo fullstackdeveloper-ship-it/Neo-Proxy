@@ -9,7 +9,7 @@ const { createNeocoreProxy, createDevicesProxy } = require("./proxyFactory");
 /**
  * Register routes for a single site
  */
-function registerSiteRoutes(app, site) {
+function registerSiteRoutes(app, site, allSites) {
   const sitePrefix = `/vpn/${site.name}`;
   
   // Register neocore route
@@ -20,7 +20,7 @@ function registerSiteRoutes(app, site) {
       console.log(`✅ Registered: ${sitePrefix}/neocore → ${site.neocore.target}`);
       
       // Direct routes for React app compatibility
-      registerDirectRoutes(app, site);
+      registerDirectRoutes(app, site, allSites);
     }
   }
   
@@ -36,18 +36,11 @@ function registerSiteRoutes(app, site) {
 
 /**
  * Register direct routes for neocore (React app compatibility)
- * These routes work within the /vpn/{site}/neocore context
- * Note: Direct /api/* and /static/* are handled by the main neocore proxy
+ * These handle requests like /static/js/main.js when React app makes direct calls
  */
-function registerDirectRoutes(app, site) {
+function registerDirectRoutes(app, site, allSites) {
   if (!site.neocore || !site.neocore.enabled) return;
   
-  // Direct routes are already handled by the main neocore proxy
-  // The proxy's pathRewrite removes /vpn/{site}/neocore prefix
-  // So /vpn/{site}/neocore/api/* becomes /api/* on target
-  // And /vpn/{site}/neocore/static/* becomes /static/* on target
-  
-  // Additional direct proxy for root-level assets accessed via neocore context
   const directProxy = createProxyMiddleware({
     target: site.neocore.target,
     changeOrigin: true,
@@ -65,13 +58,45 @@ function registerDirectRoutes(app, site) {
     }
   });
   
-  // Register site-specific direct routes (optional - for backward compatibility)
-  // These allow accessing assets directly with site prefix
-  const sitePrefix = `/vpn/${site.name}/neocore`;
+  // Site-specific direct routes (recommended approach)
+  app.use(`/static/${site.name}`, directProxy);
+  app.use(`/api/${site.name}`, directProxy);
   
-  // These routes are already covered by the main neocore proxy
-  // But we can add explicit routes if needed for specific cases
-  console.log(`✅ Direct routes available for ${site.name} via ${sitePrefix}/*`);
+  // Root-level routes with site detection from referer
+  // This handles when React app makes direct /static/* or /api/* calls
+  const rootProxy = (req, res, next) => {
+    // Check referer to determine site
+    const referer = req.headers.referer || req.headers.origin || '';
+    const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
+    
+    if (siteMatch) {
+      const detectedSiteName = siteMatch[1];
+      if (detectedSiteName === site.name) {
+        return directProxy(req, res, next);
+      }
+    }
+    
+    // If no referer or site doesn't match, try next middleware
+    next();
+  };
+  
+  // Register root routes only once (for first site to avoid conflicts)
+  // Other sites will use site-specific paths
+  const sitesArray = Object.values(allSites);
+  const isFirstSite = sitesArray[0] && sitesArray[0].name === site.name;
+  
+  if (isFirstSite) {
+    // Register root-level routes that detect site from referer
+    app.use('/static', rootProxy);
+    app.use('/api', rootProxy);
+    
+    // Root assets (images, icons, etc.)
+    app.use(/^\/([^\/]+\.(png|svg|ico|jpg|jpeg|webp|gif|woff|woff2|ttf|eot|otf|css|js))$/, rootProxy);
+    
+    console.log(`✅ Registered root-level routes with site detection for ${site.name}`);
+  }
+  
+  console.log(`✅ Registered direct routes for ${site.name}: /static/${site.name}/*, /api/${site.name}/*`);
 }
 
 /**
@@ -79,7 +104,7 @@ function registerDirectRoutes(app, site) {
  */
 function registerAllRoutes(app, sites) {
   Object.values(sites).forEach(site => {
-    registerSiteRoutes(app, site);
+    registerSiteRoutes(app, site, sites);
   });
 }
 
