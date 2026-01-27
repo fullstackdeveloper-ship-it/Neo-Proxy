@@ -54,6 +54,13 @@ function createNeocoreProxy(site) {
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
+    // Suppress WebSocket ECONNRESET errors (normal when clients disconnect)
+    wsErrorHandler: (err, req, socket, head) => {
+      // Only log non-ECONNRESET errors
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        console.error(`⚠️  WebSocket error (${site.name}/neocore):`, err.message);
+      }
+    },
 
     pathRewrite: {
       [`^/vpn/${site.name}/neocore`]: ""
@@ -69,10 +76,13 @@ function createNeocoreProxy(site) {
     },
 
     onError: (err, req, res) => {
-      trackRequest(site, 'neocore', req, 'error');
-      console.error(`❌ Neocore proxy error (${site.name}):`, err.message);
-      console.error(`   Target: ${site.neocore.target}`);
-      console.error(`   VPN IP: ${site.vpnIp}`);
+      // Suppress ECONNRESET errors (normal client disconnects)
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        trackRequest(site, 'neocore', req, 'error');
+        console.error(`❌ Neocore proxy error (${site.name}):`, err.message);
+        console.error(`   Target: ${site.neocore.target}`);
+        console.error(`   VPN IP: ${site.vpnIp}`);
+      }
       if (!res.headersSent && !res.writableEnded) {
         try {
           res.status(502).json({
@@ -133,8 +143,11 @@ function createNeocoreProxy(site) {
       });
 
       proxyRes.on("error", (err) => {
-        trackRequest(site, 'neocore', req, 'error');
-        console.error(`❌ Proxy response error (${site.name}/neocore):`, err.message);
+        // Suppress ECONNRESET errors
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          trackRequest(site, 'neocore', req, 'error');
+          console.error(`❌ Proxy response error (${site.name}/neocore):`, err.message);
+        }
         if (!res.headersSent && !res.writableEnded) {
           try {
             res.status(502).json({ error: "Proxy response error" });
@@ -184,17 +197,26 @@ function createDevicesProxy(site) {
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
+    // Suppress WebSocket ECONNRESET errors
+    wsErrorHandler: (err, req, socket, head) => {
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        console.error(`⚠️  WebSocket error (${site.name}/devices):`, err.message);
+      }
+    },
 
     pathRewrite: {
       [`^/vpn/${site.name}/devices`]: ""
     },
 
     onError: (err, req, res) => {
-      trackRequest(site, 'devices', req, 'error');
-      console.error(`❌ Devices proxy error (${site.name}):`, err.message);
-      console.error(`   Target: ${site.devices.target}`);
-      console.error(`   VPN IP: ${site.vpnIp}`);
-      console.error(`   SOCKS Port: ${site.devices.socksPort}`);
+      // Suppress ECONNRESET errors
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        trackRequest(site, 'devices', req, 'error');
+        console.error(`❌ Devices proxy error (${site.name}):`, err.message);
+        console.error(`   Target: ${site.devices.target}`);
+        console.error(`   VPN IP: ${site.vpnIp}`);
+        console.error(`   SOCKS Port: ${site.devices.socksPort}`);
+      }
       if (!res.headersSent && !res.writableEnded) {
         try {
           res.status(502).json({
@@ -274,8 +296,11 @@ function createDevicesProxy(site) {
       });
 
       proxyRes.on("error", (err) => {
-        trackRequest(site, 'devices', req, 'error');
-        console.error(`❌ Proxy response error (${site.name}/devices):`, err.message);
+        // Suppress ECONNRESET errors
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          trackRequest(site, 'devices', req, 'error');
+          console.error(`❌ Proxy response error (${site.name}/devices):`, err.message);
+        }
         if (!res.headersSent && !res.writableEnded) {
           try {
             res.status(502).json({ error: "Proxy response error" });

@@ -44,6 +44,56 @@ function trackDirectRequest(site, req, path) {
   console.log(`📥 [${timestamp}] ${method} ${path} | Direct Route | Site: ${site.name} | VPN IP: ${site.vpnIp} | Client: ${ip}`);
 }
 
+// Cache for root-level proxy instances (one per site)
+const rootProxyCache = new Map();
+
+/**
+ * Create or get cached proxy instance for a site
+ */
+function getRootProxyForSite(site) {
+  if (!rootProxyCache.has(site.name)) {
+    const proxy = createProxyMiddleware({
+      target: site.neocore.target,
+      changeOrigin: true,
+      ws: true,
+      xfwd: true,
+      secure: false,
+      timeout: 30000,
+      proxyTimeout: 30000,
+      // Suppress WebSocket ECONNRESET errors (normal when clients disconnect)
+      wsErrorHandler: (err, req, socket, head) => {
+        // Only log non-ECONNRESET errors
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          console.error(`⚠️  WebSocket error (${site.name}):`, err.message);
+        }
+      },
+      onProxyReq: (proxyReq, req, res) => {
+        if (process.env.DEBUG) {
+          console.log(`   → Root route → ${site.neocore.target}`);
+          console.log(`   → VPN IP: ${site.vpnIp}`);
+        }
+      },
+      onError: (err, req, res) => {
+        // Suppress ECONNRESET errors (normal client disconnects)
+        if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+          console.error(`❌ Root proxy error (${site.name}):`, err.message);
+        }
+        if (!res.headersSent && !res.writableEnded) {
+          try {
+            res.status(502).json({ 
+              error: "Proxy error", 
+              message: err.message,
+              site: site.name
+            });
+          } catch (e) {}
+        }
+      }
+    });
+    rootProxyCache.set(site.name, proxy);
+  }
+  return rootProxyCache.get(site.name);
+}
+
 /**
  * Register direct routes for neocore (React app compatibility)
  * These handle requests like /static/js/main.js when React app makes direct calls
@@ -59,6 +109,12 @@ function registerDirectRoutes(app, site, allSites) {
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
+    // Suppress WebSocket ECONNRESET errors
+    wsErrorHandler: (err, req, socket, head) => {
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        console.error(`⚠️  WebSocket error (${site.name}):`, err.message);
+      }
+    },
     onProxyReq: (proxyReq, req, res) => {
       trackDirectRequest(site, req, req.url);
       if (process.env.DEBUG) {
@@ -67,9 +123,12 @@ function registerDirectRoutes(app, site, allSites) {
       }
     },
     onError: (err, req, res) => {
-      console.error(`❌ Direct proxy error (${site.name}):`, err.message);
-      console.error(`   Target: ${site.neocore.target}`);
-      console.error(`   VPN IP: ${site.vpnIp}`);
+      // Suppress ECONNRESET errors
+      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+        console.error(`❌ Direct proxy error (${site.name}):`, err.message);
+        console.error(`   Target: ${site.neocore.target}`);
+        console.error(`   VPN IP: ${site.vpnIp}`);
+      }
       if (!res.headersSent && !res.writableEnded) {
         try {
           res.status(502).json({ 
@@ -96,6 +155,7 @@ function registerDirectRoutes(app, site, allSites) {
   });
   
   // Root-level routes with proper multi-site detection
+  // Create root proxy handler that reuses cached proxy instances
   const createRootProxy = () => {
     return (req, res, next) => {
       const referer = req.headers.referer || req.headers.origin || '';
@@ -107,30 +167,8 @@ function registerDirectRoutes(app, site, allSites) {
         
         if (detectedSite && detectedSite.neocore && detectedSite.neocore.enabled) {
           trackDirectRequest(detectedSite, req, `Root route (detected: ${detectedSiteName})`);
-          // Create proxy for detected site
-          const siteProxy = createProxyMiddleware({
-            target: detectedSite.neocore.target,
-            changeOrigin: true,
-            ws: true,
-            xfwd: true,
-            secure: false,
-            timeout: 30000,
-            proxyTimeout: 30000,
-            onProxyReq: (proxyReq, req, res) => {
-              if (process.env.DEBUG) {
-                console.log(`   → Root route → ${detectedSite.neocore.target}`);
-                console.log(`   → VPN IP: ${detectedSite.vpnIp}`);
-              }
-            },
-            onError: (err, req, res) => {
-              console.error(`❌ Root proxy error (${detectedSiteName}):`, err.message);
-              if (!res.headersSent && !res.writableEnded) {
-                try {
-                  res.status(502).json({ error: "Proxy error", message: err.message });
-                } catch (e) {}
-              }
-            }
-          });
+          // Reuse cached proxy instance
+          const siteProxy = getRootProxyForSite(detectedSite);
           return siteProxy(req, res, next);
         }
       }
@@ -139,15 +177,8 @@ function registerDirectRoutes(app, site, allSites) {
       const firstEnabledSite = Object.values(allSites).find(s => s.neocore?.enabled);
       if (firstEnabledSite) {
         trackDirectRequest(firstEnabledSite, req, `Root route (fallback: ${firstEnabledSite.name})`);
-        const fallbackProxy = createProxyMiddleware({
-          target: firstEnabledSite.neocore.target,
-          changeOrigin: true,
-          ws: true,
-          xfwd: true,
-          secure: false,
-          timeout: 30000,
-          proxyTimeout: 30000
-        });
+        // Reuse cached proxy instance
+        const fallbackProxy = getRootProxyForSite(firstEnabledSite);
         return fallbackProxy(req, res, next);
       }
       
