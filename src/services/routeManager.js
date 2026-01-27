@@ -11,6 +11,40 @@ const { serveAsset, serveHTML } = require("./assetsService");
  * Register HTML, assets, and API routes
  */
 function registerNeocoreRoutes(app, allSites) {
+  // Socket.io interceptor - detects site from URL path or referer
+  // Socket.io uses /socket.io/ path, not /api/socket.io/
+  app.use((req, res, next) => {
+    // Intercept /socket.io/* requests
+    if (req.url.startsWith('/socket.io')) {
+      // Method 1: Try to detect from URL path first (most reliable)
+      let siteName = null;
+      const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\/neocore\/socket\.io/);
+      if (urlMatch) {
+        siteName = urlMatch[1];
+      } else {
+        // Method 2: Fallback to referer header
+        const referer = req.headers.referer || req.headers.origin || '';
+        const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
+        if (refererMatch) {
+          siteName = refererMatch[1];
+        }
+      }
+      
+      if (siteName) {
+        const site = allSites[siteName];
+        if (site && site.neocore?.enabled) {
+          // If URL already has site prefix, keep it; otherwise add it
+          if (!req.url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
+            req.url = `/vpn/${siteName}/neocore/socket.io${req.url.substring(11)}`; // Remove '/socket.io' prefix
+            console.log(`🔄 Socket.io rewrite: ${req.originalUrl} → ${req.url} (site: ${siteName})`);
+          }
+        }
+      }
+    }
+    
+    next(); // Continue to next middleware/route
+  });
+  
   // API interceptor - detects site from URL path (more reliable than referer)
   // This runs for ALL requests, but only rewrites /api/* ones
   app.use((req, res, next) => {
@@ -161,6 +195,44 @@ function registerNeocoreRoutes(app, allSites) {
     }
   });
   
+  // Socket.io proxy routes - handle WebSocket connections (MUST be before API routes)
+  // Socket.io uses /socket.io/ path, not /api/socket.io/
+  Object.values(allSites).forEach(site => {
+    if (site.neocore && site.neocore.enabled) {
+      const socketProxy = createProxyMiddleware({
+        target: site.neocore.target,
+        changeOrigin: true,
+        ws: true, // Enable WebSocket support
+        xfwd: true,
+        secure: false,
+        timeout: 30000,
+        proxyTimeout: 30000,
+        pathRewrite: {
+          [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io'
+        },
+        wsErrorHandler: (err, req, socket, head) => {
+          // Suppress common WebSocket errors (normal disconnects)
+          if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ECONNREFUSED') {
+            console.error(`⚠️  Socket.io WebSocket error (${site.name}):`, err.message);
+          }
+        },
+        onError: (err, req, res) => {
+          if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
+            console.error(`❌ Socket.io proxy error (${site.name}):`, err.message);
+          }
+          if (!res.headersSent && !res.writableEnded) {
+            try {
+              res.status(502).json({ error: "Socket.io proxy error", message: err.message });
+            } catch (e) {}
+          }
+        }
+      });
+      
+      app.use(`/vpn/${site.name}/neocore/socket.io`, socketProxy);
+      console.log(`✅ Registered Socket.io proxy: /vpn/${site.name}/neocore/socket.io → ${site.neocore.target}/socket.io`);
+    }
+  });
+  
   // API proxy routes - proxy API calls to neocore backend (MUST be before catch-all)
   Object.values(allSites).forEach(site => {
     if (site.neocore && site.neocore.enabled) {
@@ -211,6 +283,11 @@ function registerNeocoreRoutes(app, allSites) {
     // Skip API requests (should be handled by API proxy above)
     if (req.url.includes('/api')) {
       return res.status(404).json({ error: 'API route not found' });
+    }
+    
+    // Skip socket.io requests (should be handled by socket.io proxy above)
+    if (req.url.includes('/socket.io')) {
+      return res.status(404).json({ error: 'Socket.io route not found' });
     }
     
     // Serve HTML with base tag injection (React Router will handle the routing)
