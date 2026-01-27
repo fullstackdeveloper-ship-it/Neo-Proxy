@@ -45,7 +45,7 @@ function registerNeocoreRoutes(app, allSites) {
     next(); // Continue to next middleware/route
   });
   
-  // Serve HTML from build directory for neocore routes (root and all sub-routes)
+  // Serve HTML from build directory for neocore root route
   app.get('/vpn/:siteName/neocore', (req, res) => {
     const siteName = req.params.siteName;
     const site = allSites[siteName];
@@ -58,26 +58,41 @@ function registerNeocoreRoutes(app, allSites) {
     serveHTML(req, res, siteName);
   });
   
-  // Catch-all route for React Router client-side navigation
-  // This handles routes like /vpn/site1/neocore/overview, /vpn/site1/neocore/logs, etc.
-  app.get('/vpn/:siteName/neocore/*', (req, res) => {
+  // Assets serving endpoint - serve files as-is (no rewriting) at root level
+  app.get(/^\/(main\.[^\/]+\.(js|css))$/, (req, res) => {
+    serveAsset(req, res);
+  });
+  
+  // Serve static JS/CSS assets under site prefix (for base tag compatibility)
+  // Handles: /vpn/site1/neocore/static/js/main.e1802fd1.js
+  app.get('/vpn/:siteName/neocore/static/:type/:fileName', (req, res) => {
     const siteName = req.params.siteName;
+    const type = req.params.type; // 'js' or 'css'
+    const fileName = req.params.fileName;
     const site = allSites[siteName];
     
     if (!site || !site.neocore?.enabled) {
       return res.status(404).json({ error: 'Site not found' });
     }
     
-    // Serve HTML with base tag injection (React Router will handle the routing)
-    serveHTML(req, res, siteName);
+    // Serve the asset file
+    const fs = require('fs');
+    const path = require('path');
+    const assetPath = path.join(__dirname, '../build/static', type, fileName);
+    
+    if (fs.existsSync(assetPath)) {
+      const contentType = type === 'js' ? 'application/javascript' : 'text/css';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.sendFile(assetPath);
+      console.log(`📦 Served static asset: ${type}/${fileName} (site: ${siteName})`);
+    } else {
+      res.status(404).json({ error: 'Asset not found' });
+    }
   });
   
-  // Assets serving endpoint - serve files as-is (no rewriting)
-  app.get(/^\/(main\.[^\/]+\.(js|css))$/, (req, res) => {
-    serveAsset(req, res);
-  });
-  
-  // Serve static assets (images, icons, etc.) from build directory
+  // Serve root-level static assets (images, icons, etc.) under site prefix
+  // Handles: /vpn/site1/neocore/nslogo.png, /vpn/site1/neocore/favicon.ico, etc.
   app.get('/vpn/:siteName/neocore/:assetFile', (req, res) => {
     const siteName = req.params.siteName;
     const assetFile = req.params.assetFile;
@@ -92,15 +107,51 @@ function registerNeocoreRoutes(app, allSites) {
       return res.status(404).json({ error: 'Use /vpn/{site}/neocore/api/* for API calls' });
     }
     
+    // Skip if it's a static directory request (handled by route above)
+    if (assetFile === 'static') {
+      return res.status(404).json({ error: 'Use /vpn/{site}/neocore/static/{type}/{file} for static assets' });
+    }
+    
     const fs = require('fs');
     const path = require('path');
     const assetPath = path.join(__dirname, '../build', assetFile);
     
     if (fs.existsSync(assetPath)) {
+      // Determine content type
+      const ext = path.extname(assetFile).toLowerCase();
+      const contentTypes = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.svg': 'image/svg+xml',
+        '.ico': 'image/x-icon',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp'
+      };
+      const contentType = contentTypes[ext] || 'application/octet-stream';
+      
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
       res.sendFile(assetPath);
+      console.log(`📦 Served asset: ${assetFile} (site: ${siteName})`);
     } else {
       res.status(404).json({ error: 'Asset not found' });
     }
+  });
+  
+  // Catch-all route for React Router client-side navigation (MUST be last)
+  // This handles routes like /vpn/site1/neocore/overview, /vpn/site1/neocore/logs, etc.
+  // Must be after all specific routes to avoid catching asset requests
+  app.get('/vpn/:siteName/neocore/*', (req, res) => {
+    const siteName = req.params.siteName;
+    const site = allSites[siteName];
+    
+    if (!site || !site.neocore?.enabled) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Serve HTML with base tag injection (React Router will handle the routing)
+    serveHTML(req, res, siteName);
   });
   
   // API proxy routes - proxy API calls to neocore backend
