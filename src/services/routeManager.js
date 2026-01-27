@@ -63,6 +63,28 @@ function registerNeocoreRoutes(app, allSites) {
     serveAsset(req, res);
   });
   
+  // Handle root-level /static/* requests (fallback if base tag doesn't work)
+  // These should normally be handled by base tag, but adding as safety
+  // Just serve the file directly - assets are the same for all sites
+  app.get('/static/:type/:fileName', (req, res) => {
+    const type = req.params.type; // 'js' or 'css'
+    const fileName = req.params.fileName;
+    
+    const fs = require('fs');
+    const path = require('path');
+    const assetPath = path.join(__dirname, '../build/static', type, fileName);
+    
+    if (fs.existsSync(assetPath)) {
+      const contentType = type === 'js' ? 'application/javascript' : 'text/css';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.sendFile(assetPath);
+      console.log(`📦 Served static asset (root fallback): ${type}/${fileName}`);
+    } else {
+      res.status(404).json({ error: 'Asset not found' });
+    }
+  });
+  
   // Serve static JS/CSS assets under site prefix (for base tag compatibility)
   // Handles: /vpn/site1/neocore/static/js/main.e1802fd1.js
   app.get('/vpn/:siteName/neocore/static/:type/:fileName', (req, res) => {
