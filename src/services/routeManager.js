@@ -11,6 +11,30 @@ const { serveAsset, serveHTML } = require("./assetsService");
  * Register HTML, assets, and API routes
  */
 function registerNeocoreRoutes(app, allSites) {
+  // Simple API interceptor - catches /api/* requests and rewrites based on referer
+  // This runs for ALL requests, but only rewrites /api/* ones
+  app.use((req, res, next) => {
+    // Only intercept /api/* requests
+    if (req.url.startsWith('/api')) {
+      // Detect site from referer
+      const referer = req.headers.referer || req.headers.origin || '';
+      const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
+      
+      if (siteMatch) {
+        const siteName = siteMatch[1];
+        const site = allSites[siteName];
+        
+        if (site && site.neocore?.enabled) {
+          // Rewrite URL: /api/health -> /vpn/site1/neocore/api/health
+          req.url = `/vpn/${siteName}/neocore/api${req.url.substring(4)}`; // Remove '/api' prefix
+          console.log(`🔄 API rewrite: ${req.originalUrl} → ${req.url} (site: ${siteName})`);
+        }
+      }
+    }
+    
+    next(); // Continue to next middleware/route
+  });
+  
   // Serve HTML from build directory for neocore routes
   app.get('/vpn/:siteName/neocore', (req, res) => {
     const siteName = req.params.siteName;
@@ -20,14 +44,13 @@ function registerNeocoreRoutes(app, allSites) {
       return res.status(404).json({ error: 'Site not found' });
     }
     
-    // Serve HTML from build directory
-    serveHTML(req, res, siteName);
+    // Serve HTML as-is (no rewriting)
+    serveHTML(req, res);
   });
   
-  // Assets serving endpoint - handle main.js and main.css
-  // Site is detected from referer header
+  // Assets serving endpoint - serve files as-is (no rewriting)
   app.get(/^\/(main\.[^\/]+\.(js|css))$/, (req, res) => {
-    serveAsset(req, res, allSites);
+    serveAsset(req, res);
   });
   
   // Serve static assets (images, icons, etc.) from build directory
