@@ -1,11 +1,9 @@
 /**
  * VPN Proxy Service - Main Entry Point
- * Dynamic multi-site proxy service for Neocore and local devices
  */
 
 const express = require("express");
 const http = require("http");
-const cookieParser = require("cookie-parser");
 const SITES = require("./config/sites");
 const { initializeTunnels, shutdownAllTunnels } = require("./services/tunnelManager");
 const { registerAllRoutes } = require("./services/routeManager");
@@ -13,90 +11,51 @@ const { registerAllRoutes } = require("./services/routeManager");
 const app = express();
 const server = http.createServer(app);
 
-// Cookie parser middleware (required for session management)
-app.use(cookieParser());
-
-// Request tracking middleware for all requests
+// Request logging
 app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
-  const method = req.method;
-  const url = req.url;
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
-  console.log(`🌐 [${timestamp}] ${method} ${url} | Client: ${ip}`);
+  console.log(`🌐 ${req.method} ${req.url} | ${req.ip || 'unknown'}`);
   next();
 });
 
-/* =========================
-   HEALTH CHECK
-========================= */
-
+// Health check
 app.get("/health", (req, res) => {
-  const status = {
+  res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     sites: Object.values(SITES).map(site => ({
       name: site.name,
       vpnIp: site.vpnIp,
-      neocore: {
-        enabled: site.neocore?.enabled || false,
-        target: site.neocore?.target
-      },
-      devices: {
-        enabled: site.devices?.enabled || false,
-        tunnelReady: site.devices?.tunnelReady || false,
-        socksPort: site.devices?.socksPort
-      }
+      neocore: { enabled: site.neocore?.enabled || false, target: site.neocore?.target },
+      devices: { enabled: site.devices?.enabled || false, tunnelReady: site.devices?.tunnelReady || false }
     }))
-  };
-  res.json(status);
+  });
 });
 
-/* =========================
-   REGISTER ALL ROUTES
-   (Routes will be registered after server is created)
-========================= */
-
-/* =========================
-   GRACEFUL SHUTDOWN
-========================= */
-
-process.on("SIGTERM", () => {
-  console.log("🛑 SIGTERM received, shutting down gracefully...");
+// Graceful shutdown
+const shutdown = () => {
+  console.log("🛑 Shutting down gracefully...");
   shutdownAllTunnels(SITES);
   process.exit(0);
-});
+};
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
-process.on("SIGINT", () => {
-  console.log("🛑 SIGINT received, shutting down gracefully...");
-  shutdownAllTunnels(SITES);
-  process.exit(0);
-});
-
-/* =========================
-   SERVER START
-========================= */
-
+// Initialize
 const PORT = process.env.PORT || 3003;
 const HOST = process.env.HOST || "0.0.0.0";
 
-// Initialize SOCKS tunnels for all sites
 initializeTunnels(SITES);
-
-// Register routes (this must be called before server.listen)
 registerAllRoutes(app, SITES, server);
 
 server.listen(PORT, HOST, () => {
-  console.log(`\n✅ VPN Proxy Service running → http://${HOST}:${PORT}`);
-  console.log(`\n📋 Available Sites:`);
+  console.log(`\n✅ VPN Proxy Service → http://${HOST}:${PORT}\n`);
   Object.values(SITES).forEach(s => {
-    console.log(`\n   🏢 Site: ${s.name} (VPN: ${s.vpnIp})`);
     if (s.neocore?.enabled) {
-      console.log(`      🌐 /vpn/${s.name}/neocore → ${s.neocore.target}`);
-      console.log(`      🔌 Socket.io: /vpn/${s.name}/neocore/socket.io → ${s.neocore.target}/socket.io`);
+      console.log(`   🌐 /vpn/${s.name}/neocore → ${s.neocore.target}`);
     }
     if (s.devices?.enabled) {
-      console.log(`      🔧 /vpn/${s.name}/devices → ${s.devices.target} (SOCKS:${s.devices.socksPort})`);
+      console.log(`   🔧 /vpn/${s.name}/devices → ${s.devices.target} (SOCKS:${s.devices.socksPort})`);
     }
   });
-  console.log(`\n   ❤️  /health → Health check endpoint\n`);
+  console.log(`   ❤️  /health\n`);
 });
