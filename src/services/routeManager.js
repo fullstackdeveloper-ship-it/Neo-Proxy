@@ -1,5 +1,6 @@
 /**
  * Route Manager - Registers routes for all sites and services
+ * Perfect implementation for site-specific socket.io connections
  */
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
@@ -12,13 +13,13 @@ const path = require('path');
  * Detect site from URL, referer header, or cookies
  */
 function detectSite(req, allSites) {
-  // Try URL path first
+  // Try URL path first (most reliable)
   const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
   if (urlMatch) {
     return allSites[urlMatch[1]];
   }
   
-  // Try referer header (full URL with path)
+  // Try referer header (full URL with path) - works for HTTP requests
   const referer = req.headers.referer || '';
   const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
   if (refererMatch) {
@@ -50,12 +51,13 @@ function createProxy(target, pathRewrite, siteName) {
   return createProxyMiddleware({
     target,
     changeOrigin: true,
-    ws: true, // Enable WebSocket support - middleware handles upgrades automatically
+    ws: true, // Enable WebSocket support
     xfwd: true,
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
     pathRewrite,
+    logLevel: 'warn', // Reduce noise
     wsErrorHandler: (err, req, socket) => {
       // Suppress common WebSocket errors (normal disconnects)
       if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ECONNREFUSED') {
@@ -67,6 +69,12 @@ function createProxy(target, pathRewrite, siteName) {
         try {
           res.status(502).json({ error: "Proxy error", message: err.message });
         } catch (e) {}
+      }
+    },
+    onProxyReq: (proxyReq, req, res) => {
+      // Log proxy requests for debugging
+      if (process.env.DEBUG) {
+        console.log(`   → Proxying ${req.method} ${req.url} to ${target}`);
       }
     }
   });
@@ -89,36 +97,180 @@ function serveStaticFile(filePath, res, contentType) {
  * Register Neocore routes (HTML, assets, API, Socket.io)
  */
 function registerNeocoreRoutes(app, allSites, server) {
-  // URL rewrite interceptors (for HTTP requests)
+  // Create socket.io proxies for each site FIRST (before other routes)
+  const socketProxies = new Map();
+  const apiProxies = new Map();
+  
+  Object.values(allSites).forEach(site => {
+    if (site.neocore?.enabled) {
+      // Socket.io proxy - site-specific
+      const socketProxy = createProxy(
+        site.neocore.target,
+        { [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io' },
+        site.name
+      );
+      socketProxies.set(site.name, socketProxy);
+      
+      // API proxy - site-specific
+      const apiProxy = createProxy(
+        site.neocore.target,
+        { [`^/vpn/${site.name}/neocore/api`]: '/api' },
+        site.name
+      );
+      apiProxies.set(site.name, apiProxy);
+      
+      console.log(`✅ Registered proxies for ${site.name}:`);
+      console.log(`   🔌 /vpn/${site.name}/neocore/socket.io → ${site.neocore.target}/socket.io`);
+      console.log(`   🌐 /vpn/${site.name}/neocore/api → ${site.neocore.target}/api`);
+    }
+  });
+
+  // URL rewrite interceptors (for HTTP requests - socket.io polling, API calls)
   app.use((req, res, next) => {
-    if (req.url.startsWith('/socket.io') || req.url.startsWith('/api')) {
+    // Only intercept socket.io and API requests without site prefix
+    if ((req.url.startsWith('/socket.io') || req.url.startsWith('/api')) && !req.url.startsWith('/vpn/')) {
       const site = detectSite(req, allSites);
       if (site?.neocore?.enabled) {
         const prefix = `/vpn/${site.name}/neocore`;
-        if (req.url.startsWith('/socket.io') && !req.url.startsWith(prefix)) {
+        if (req.url.startsWith('/socket.io')) {
           req.url = `${prefix}/socket.io${req.url.substring(11)}`;
-          console.log(`🔄 Socket.io rewrite: ${req.url} → ${site.name}`);
-        } else if (req.url.startsWith('/api') && !req.url.startsWith(prefix)) {
+          console.log(`🔄 Socket.io rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
+        } else if (req.url.startsWith('/api')) {
           req.url = `${prefix}/api${req.url.substring(4)}`;
-          console.log(`🔄 API rewrite: ${req.url} → ${site.name}`);
+          console.log(`🔄 API rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
         }
       } else {
-        // Fallback: use first available site
-        const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
-        if (firstSite) {
-          const prefix = `/vpn/${firstSite.name}/neocore`;
-          if (req.url.startsWith('/socket.io') && !req.url.startsWith(prefix)) {
-            req.url = `${prefix}/socket.io${req.url.substring(11)}`;
-            console.log(`🔄 Socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
-          } else if (req.url.startsWith('/api') && !req.url.startsWith(prefix)) {
-            req.url = `${prefix}/api${req.url.substring(4)}`;
-            console.log(`🔄 API rewrite (fallback): ${req.url} → ${firstSite.name}`);
-          }
-        }
+        console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
       }
     }
     next();
   });
+
+  // Register site-specific socket.io routes (MUST be before root-level route)
+  Object.values(allSites).forEach(site => {
+    if (site.neocore?.enabled) {
+      app.use(`/vpn/${site.name}/neocore/socket.io`, socketProxies.get(site.name));
+      app.use(`/vpn/${site.name}/neocore/api`, apiProxies.get(site.name));
+    }
+  });
+
+  // Root-level socket.io route (fallback - handles /socket.io/ requests)
+  app.use('/socket.io', (req, res, next) => {
+    const site = detectSite(req, allSites);
+    if (site?.neocore?.enabled) {
+      // Rewrite to site-prefixed path and use the site's proxy
+      const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+      req.url = `/vpn/${site.name}/neocore/socket.io${queryString}`;
+      console.log(`🔄 Root socket.io rewrite: ${req.url} → ${site.name}`);
+      const proxy = socketProxies.get(site.name);
+      if (proxy) {
+        return proxy(req, res, next);
+      }
+    }
+    // Fallback to first site (not ideal, but better than failing)
+    const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
+    if (firstSite) {
+      const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+      req.url = `/vpn/${firstSite.name}/neocore/socket.io${queryString}`;
+      console.log(`🔄 Root socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
+      const proxy = socketProxies.get(firstSite.name);
+      if (proxy) {
+        return proxy(req, res, next);
+      }
+    }
+    res.status(404).json({ error: 'Socket.io endpoint not found - no site detected' });
+  });
+
+  // WebSocket upgrade handler - CRITICAL for WebSocket connections
+  if (server && socketProxies.size > 0) {
+    // Remove any existing upgrade listeners to avoid conflicts
+    server.removeAllListeners('upgrade');
+    
+    server.on('upgrade', (req, socket, head) => {
+      let url = req.url || '';
+      const origin = req.headers.origin || '';
+      const referer = req.headers.referer || '';
+      
+      console.log(`🔌 WebSocket upgrade: ${url}`);
+      console.log(`   Origin: ${origin}`);
+      console.log(`   Referer: ${referer}`);
+      
+      // If URL doesn't have site prefix, detect site and rewrite
+      if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
+        const site = detectSite(req, allSites);
+        if (site?.neocore?.enabled) {
+          // Rewrite URL to include site prefix
+          const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
+          url = `/vpn/${site.name}/neocore/socket.io${queryString}`;
+          req.url = url;
+          console.log(`   ✅ Site detected: ${site.name}, rewritten to: ${url}`);
+        } else {
+          // Try to extract site from referer or origin
+          let detectedSite = null;
+          
+          // Check referer first (most reliable for WebSocket upgrades)
+          if (referer) {
+            const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
+            if (refererMatch) {
+              detectedSite = allSites[refererMatch[1]];
+            }
+          }
+          
+          // Check origin as fallback
+          if (!detectedSite && origin) {
+            // Origin doesn't have path, but we can check if it matches any site's target
+            // This is less reliable, so we'll use first site as fallback
+            const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
+            if (firstSite) {
+              detectedSite = firstSite;
+              console.log(`   ⚠️  Using fallback site: ${firstSite.name} (could not detect from headers)`);
+            }
+          }
+          
+          if (detectedSite?.neocore?.enabled) {
+            const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
+            url = `/vpn/${detectedSite.name}/neocore/socket.io${queryString}`;
+            req.url = url;
+            console.log(`   ✅ Using detected site: ${detectedSite.name}`);
+          } else {
+            // Last resort: use first available site
+            const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
+            if (firstSite) {
+              const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
+              url = `/vpn/${firstSite.name}/neocore/socket.io${queryString}`;
+              req.url = url;
+              console.log(`   ⚠️  No site detected, using fallback: ${firstSite.name}`);
+            } else {
+              console.error(`   ❌ WebSocket upgrade: No site detected and no fallback available`);
+              socket.destroy();
+              return;
+            }
+          }
+        }
+      }
+      
+      // Route to correct proxy based on rewritten URL
+      for (const [siteName, proxy] of socketProxies.entries()) {
+        if (url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
+          console.log(`   ✅ Routing WebSocket to: ${siteName} → ${allSites[siteName].neocore.target}/socket.io`);
+          try {
+            proxy.upgrade(req, socket, head);
+            return;
+          } catch (err) {
+            console.error(`   ❌ Error upgrading WebSocket for ${siteName}:`, err.message);
+            socket.destroy();
+            return;
+          }
+        }
+      }
+      
+      // No match - close connection
+      console.error(`   ❌ WebSocket upgrade: No proxy found for ${url}`);
+      socket.destroy();
+    });
+    
+    console.log(`✅ WebSocket upgrade handler registered for ${socketProxies.size} site(s)`);
+  }
 
   // HTML route
   app.get('/vpn/:siteName/neocore', (req, res) => {
@@ -170,108 +322,7 @@ function registerNeocoreRoutes(app, allSites, server) {
     }
   });
 
-  // Socket.io and API proxies
-  const socketProxies = new Map();
-  
-  Object.values(allSites).forEach(site => {
-    if (site.neocore?.enabled) {
-      // Socket.io proxy
-      const socketProxy = createProxy(
-        site.neocore.target,
-        { [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io' },
-        site.name
-      );
-      socketProxies.set(site.name, socketProxy);
-      app.use(`/vpn/${site.name}/neocore/socket.io`, socketProxy);
-
-      // API proxy
-      const apiProxy = createProxy(
-        site.neocore.target,
-        { [`^/vpn/${site.name}/neocore/api`]: '/api' },
-        site.name
-      );
-      app.use(`/vpn/${site.name}/neocore/api`, apiProxy);
-    }
-  });
-
-  // Root-level socket.io route (fallback for clients connecting to /socket.io/)
-  // This handles HTTP polling requests
-  app.use('/socket.io', (req, res, next) => {
-    const site = detectSite(req, allSites);
-    if (site?.neocore?.enabled) {
-      // Rewrite to site-prefixed path
-      req.url = `/vpn/${site.name}/neocore/socket.io${req.url.substring(11)}`;
-      console.log(`🔄 Root socket.io rewrite: ${req.url} → ${site.name}`);
-      // Find the proxy and use it
-      const proxy = socketProxies.get(site.name);
-      if (proxy) {
-        return proxy(req, res, next);
-      }
-    }
-    // Fallback to first site
-    const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
-    if (firstSite) {
-      req.url = `/vpn/${firstSite.name}/neocore/socket.io${req.url.substring(11)}`;
-      console.log(`🔄 Root socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
-      const proxy = socketProxies.get(firstSite.name);
-      if (proxy) {
-        return proxy(req, res, next);
-      }
-    }
-    res.status(404).json({ error: 'Socket.io endpoint not found' });
-  });
-
-  // WebSocket upgrade handler - route upgrades to correct proxy
-  if (server && socketProxies.size > 0) {
-    server.on('upgrade', (req, socket, head) => {
-      let url = req.url || '';
-      
-      console.log(`🔌 WebSocket upgrade request: ${url}`);
-      console.log(`   Origin: ${req.headers.origin || 'none'}`);
-      console.log(`   Referer: ${req.headers.referer || 'none'}`);
-      console.log(`   Cookie: ${req.headers.cookie || 'none'}`);
-      
-      // If URL doesn't have site prefix, detect site and rewrite
-      if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
-        const site = detectSite(req, allSites);
-        if (site?.neocore?.enabled) {
-          // Rewrite URL to include site prefix
-          const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-          url = `/vpn/${site.name}/neocore/socket.io${queryString}`;
-          req.url = url;
-          console.log(`   ✅ Site detected: ${site.name}, rewritten to: ${url}`);
-        } else {
-          // Try to get site from first available site as fallback
-          const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
-          if (firstSite) {
-            const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-            url = `/vpn/${firstSite.name}/neocore/socket.io${queryString}`;
-            req.url = url;
-            console.log(`   ⚠️  No site detected, using fallback: ${firstSite.name}`);
-          } else {
-            console.error(`   ❌ WebSocket upgrade: No site detected and no fallback available`);
-            socket.destroy();
-            return;
-          }
-        }
-      }
-      
-      // Route to correct proxy
-      for (const [siteName, proxy] of socketProxies.entries()) {
-        if (url.startsWith(`/vpn/${siteName}/neocore/socket.io`)) {
-          console.log(`   ✅ Routing to: ${siteName} → ${allSites[siteName].neocore.target}`);
-          proxy.upgrade(req, socket, head);
-          return;
-        }
-      }
-      
-      // No match - close connection
-      console.error(`   ❌ WebSocket upgrade: No proxy found for ${url}`);
-      socket.destroy();
-    });
-  }
-
-  // Catch-all for React Router
+  // Catch-all for React Router (MUST be last)
   app.get('/vpn/:siteName/neocore/*', (req, res) => {
     const site = allSites[req.params.siteName];
     if (!site?.neocore?.enabled || req.url.includes('/api') || req.url.includes('/socket.io')) {
