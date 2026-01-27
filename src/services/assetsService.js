@@ -8,8 +8,35 @@ const path = require('path');
 
 const BUILD_DIR = path.join(__dirname, '../build');
 const ASSETS_DIR = path.join(BUILD_DIR, 'static');
-const JS_FILE = 'js/main.e1802fd1.js';
-const CSS_FILE = 'css/main.959413d2.css';
+
+/**
+ * Dynamically find the main JS and CSS files (handles build hash changes)
+ */
+function findAssetFiles() {
+  const jsDir = path.join(ASSETS_DIR, 'js');
+  const cssDir = path.join(ASSETS_DIR, 'css');
+  
+  let jsFile = null;
+  let cssFile = null;
+  
+  // Find main.*.js file
+  if (fs.existsSync(jsDir)) {
+    const jsFiles = fs.readdirSync(jsDir).filter(f => f.startsWith('main.') && f.endsWith('.js'));
+    if (jsFiles.length > 0) {
+      jsFile = `js/${jsFiles[0]}`;
+    }
+  }
+  
+  // Find main.*.css file
+  if (fs.existsSync(cssDir)) {
+    const cssFiles = fs.readdirSync(cssDir).filter(f => f.startsWith('main.') && f.endsWith('.css'));
+    if (cssFiles.length > 0) {
+      cssFile = `css/${cssFiles[0]}`;
+    }
+  }
+  
+  return { jsFile, cssFile };
+}
 
 /**
  * Serve asset file (as-is, no rewriting)
@@ -19,12 +46,21 @@ function serveAsset(req, res) {
     const url = req.url;
     let filePath, contentType;
     
+    // Dynamically find asset files (handles build hash changes)
+    const { jsFile, cssFile } = findAssetFiles();
+    
     // Determine file from URL
     if (url.includes('main.') && url.endsWith('.js')) {
-      filePath = path.join(ASSETS_DIR, JS_FILE);
+      if (!jsFile) {
+        return res.status(404).json({ error: 'JS file not found in build' });
+      }
+      filePath = path.join(ASSETS_DIR, jsFile);
       contentType = 'application/javascript';
     } else if (url.includes('main.') && url.endsWith('.css')) {
-      filePath = path.join(ASSETS_DIR, CSS_FILE);
+      if (!cssFile) {
+        return res.status(404).json({ error: 'CSS file not found in build' });
+      }
+      filePath = path.join(ASSETS_DIR, cssFile);
       contentType = 'text/css';
     } else {
       return res.status(404).json({ error: 'Asset not found' });
