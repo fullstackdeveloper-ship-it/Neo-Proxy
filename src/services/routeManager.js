@@ -35,13 +35,14 @@ function createProxy(target, pathRewrite, siteName) {
   return createProxyMiddleware({
     target,
     changeOrigin: true,
-    ws: true,
+    ws: true, // Enable WebSocket support - middleware handles upgrades automatically
     xfwd: true,
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
     pathRewrite,
-    wsErrorHandler: (err) => {
+    wsErrorHandler: (err, req, socket) => {
+      // Suppress common WebSocket errors (normal disconnects)
       if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ECONNREFUSED') {
         console.error(`⚠️  WebSocket error (${siteName}):`, err.message);
       }
@@ -163,7 +164,7 @@ function registerNeocoreRoutes(app, allSites, server) {
     }
   });
 
-  // WebSocket upgrade handler
+  // WebSocket upgrade handler - route upgrades to correct proxy
   if (server && socketProxies.size > 0) {
     server.on('upgrade', (req, socket, head) => {
       const url = req.url || '';
@@ -173,6 +174,8 @@ function registerNeocoreRoutes(app, allSites, server) {
           return;
         }
       }
+      // No match - close connection
+      socket.destroy();
     });
   }
 

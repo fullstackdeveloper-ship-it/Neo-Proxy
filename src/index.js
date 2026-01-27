@@ -11,6 +11,9 @@ const { registerAllRoutes } = require("./services/routeManager");
 const app = express();
 const server = http.createServer(app);
 
+// Attach server to app for WebSocket support
+app.set('server', server);
+
 // Request logging
 app.use((req, res, next) => {
   console.log(`🌐 ${req.method} ${req.url} | ${req.ip || 'unknown'}`);
