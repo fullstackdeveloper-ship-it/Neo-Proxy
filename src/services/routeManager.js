@@ -11,23 +11,33 @@ const { serveAsset, serveHTML } = require("./assetsService");
  * Register HTML, assets, and API routes
  */
 function registerNeocoreRoutes(app, allSites) {
-  // Simple API interceptor - catches /api/* requests and rewrites based on referer
+  // API interceptor - detects site from URL path (more reliable than referer)
   // This runs for ALL requests, but only rewrites /api/* ones
   app.use((req, res, next) => {
     // Only intercept /api/* requests
     if (req.url.startsWith('/api')) {
-      // Detect site from referer
-      const referer = req.headers.referer || req.headers.origin || '';
-      const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
+      // Method 1: Try to detect from URL path first (most reliable)
+      let siteName = null;
+      const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\/neocore\/api/);
+      if (urlMatch) {
+        siteName = urlMatch[1];
+      } else {
+        // Method 2: Fallback to referer header
+        const referer = req.headers.referer || req.headers.origin || '';
+        const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
+        if (refererMatch) {
+          siteName = refererMatch[1];
+        }
+      }
       
-      if (siteMatch) {
-        const siteName = siteMatch[1];
+      if (siteName) {
         const site = allSites[siteName];
-        
         if (site && site.neocore?.enabled) {
-          // Rewrite URL: /api/health -> /vpn/site1/neocore/api/health
-          req.url = `/vpn/${siteName}/neocore/api${req.url.substring(4)}`; // Remove '/api' prefix
-          console.log(`🔄 API rewrite: ${req.originalUrl} → ${req.url} (site: ${siteName})`);
+          // If URL already has site prefix, keep it; otherwise add it
+          if (!req.url.startsWith(`/vpn/${siteName}/neocore/api`)) {
+            req.url = `/vpn/${siteName}/neocore/api${req.url.substring(4)}`; // Remove '/api' prefix
+            console.log(`🔄 API rewrite: ${req.originalUrl} → ${req.url} (site: ${siteName})`);
+          }
         }
       }
     }
@@ -35,7 +45,7 @@ function registerNeocoreRoutes(app, allSites) {
     next(); // Continue to next middleware/route
   });
   
-  // Serve HTML from build directory for neocore routes
+  // Serve HTML from build directory for neocore routes (root and all sub-routes)
   app.get('/vpn/:siteName/neocore', (req, res) => {
     const siteName = req.params.siteName;
     const site = allSites[siteName];
@@ -44,8 +54,22 @@ function registerNeocoreRoutes(app, allSites) {
       return res.status(404).json({ error: 'Site not found' });
     }
     
-    // Serve HTML as-is (no rewriting)
-    serveHTML(req, res);
+    // Serve HTML with base tag injection
+    serveHTML(req, res, siteName);
+  });
+  
+  // Catch-all route for React Router client-side navigation
+  // This handles routes like /vpn/site1/neocore/overview, /vpn/site1/neocore/logs, etc.
+  app.get('/vpn/:siteName/neocore/*', (req, res) => {
+    const siteName = req.params.siteName;
+    const site = allSites[siteName];
+    
+    if (!site || !site.neocore?.enabled) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    // Serve HTML with base tag injection (React Router will handle the routing)
+    serveHTML(req, res, siteName);
   });
   
   // Assets serving endpoint - serve files as-is (no rewriting)

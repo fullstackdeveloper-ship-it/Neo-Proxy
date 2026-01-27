@@ -48,9 +48,9 @@ function serveAsset(req, res) {
 }
 
 /**
- * Serve HTML from build directory (as-is, no rewriting)
+ * Serve HTML from build directory with base tag injection for React Router
  */
-function serveHTML(req, res) {
+function serveHTML(req, res, siteName) {
   try {
     const htmlPath = path.join(BUILD_DIR, 'index.html');
     
@@ -58,10 +58,27 @@ function serveHTML(req, res) {
       return res.status(404).json({ error: 'Frontend build not found' });
     }
     
-    res.setHeader('Content-Type', 'text/html');
-    res.sendFile(htmlPath);
+    // Read HTML file
+    let html = fs.readFileSync(htmlPath, 'utf8');
     
-    console.log(`📄 Served HTML`);
+    // Inject base tag if siteName is provided
+    if (siteName) {
+      const basePath = `/vpn/${siteName}/neocore`;
+      
+      // Check if base tag already exists
+      if (!html.includes('<base')) {
+        // Inject base tag right after <head>
+        html = html.replace('<head>', `<head>\n<base href="${basePath}/">`);
+      } else {
+        // Replace existing base tag
+        html = html.replace(/<base[^>]*>/, `<base href="${basePath}/">`);
+      }
+    }
+    
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
+    
+    console.log(`📄 Served HTML${siteName ? ` (site: ${siteName})` : ''}`);
   } catch (err) {
     console.error(`❌ Error serving HTML:`, err.message);
     if (!res.headersSent) {
