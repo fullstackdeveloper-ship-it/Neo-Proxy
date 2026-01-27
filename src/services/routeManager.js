@@ -35,6 +35,16 @@ function registerSiteRoutes(app, site, allSites) {
 }
 
 /**
+ * Request tracking for direct routes
+ */
+function trackDirectRequest(site, req, path) {
+  const timestamp = new Date().toISOString();
+  const method = req.method;
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  console.log(`📥 [${timestamp}] ${method} ${path} | Direct Route | Site: ${site.name} | VPN IP: ${site.vpnIp} | Client: ${ip}`);
+}
+
+/**
  * Register direct routes for neocore (React app compatibility)
  * These handle requests like /static/js/main.js when React app makes direct calls
  */
@@ -49,51 +59,112 @@ function registerDirectRoutes(app, site, allSites) {
     secure: false,
     timeout: 30000,
     proxyTimeout: 30000,
+    onProxyReq: (proxyReq, req, res) => {
+      trackDirectRequest(site, req, req.url);
+      if (process.env.DEBUG) {
+        console.log(`   → Direct route to: ${site.neocore.target}`);
+        console.log(`   → VPN IP: ${site.vpnIp}`);
+      }
+    },
     onError: (err, req, res) => {
+      console.error(`❌ Direct proxy error (${site.name}):`, err.message);
+      console.error(`   Target: ${site.neocore.target}`);
+      console.error(`   VPN IP: ${site.vpnIp}`);
       if (!res.headersSent && !res.writableEnded) {
         try {
-          res.status(502).json({ error: "Proxy error", message: err.message });
+          res.status(502).json({ 
+            error: "Proxy error", 
+            message: err.message,
+            site: site.name,
+            target: site.neocore.target,
+            vpnIp: site.vpnIp
+          });
         } catch (e) {}
       }
     }
   });
   
-  // Site-specific direct routes (recommended approach)
-  app.use(`/static/${site.name}`, directProxy);
-  app.use(`/api/${site.name}`, directProxy);
+  // Site-specific direct routes (always register these - no conflicts)
+  app.use(`/static/${site.name}`, (req, res, next) => {
+    trackDirectRequest(site, req, `/static/${site.name}${req.url}`);
+    directProxy(req, res, next);
+  });
   
-  // Root-level routes with site detection from referer
-  // This handles when React app makes direct /static/* or /api/* calls
-  const rootProxy = (req, res, next) => {
-    // Check referer to determine site
-    const referer = req.headers.referer || req.headers.origin || '';
-    const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
-    
-    if (siteMatch) {
-      const detectedSiteName = siteMatch[1];
-      if (detectedSiteName === site.name) {
-        return directProxy(req, res, next);
+  app.use(`/api/${site.name}`, (req, res, next) => {
+    trackDirectRequest(site, req, `/api/${site.name}${req.url}`);
+    directProxy(req, res, next);
+  });
+  
+  // Root-level routes with proper multi-site detection
+  const createRootProxy = () => {
+    return (req, res, next) => {
+      const referer = req.headers.referer || req.headers.origin || '';
+      const siteMatch = referer.match(/\/vpn\/([^\/]+)\//);
+      
+      if (siteMatch) {
+        const detectedSiteName = siteMatch[1];
+        const detectedSite = allSites[detectedSiteName];
+        
+        if (detectedSite && detectedSite.neocore && detectedSite.neocore.enabled) {
+          trackDirectRequest(detectedSite, req, `Root route (detected: ${detectedSiteName})`);
+          // Create proxy for detected site
+          const siteProxy = createProxyMiddleware({
+            target: detectedSite.neocore.target,
+            changeOrigin: true,
+            ws: true,
+            xfwd: true,
+            secure: false,
+            timeout: 30000,
+            proxyTimeout: 30000,
+            onProxyReq: (proxyReq, req, res) => {
+              if (process.env.DEBUG) {
+                console.log(`   → Root route → ${detectedSite.neocore.target}`);
+                console.log(`   → VPN IP: ${detectedSite.vpnIp}`);
+              }
+            },
+            onError: (err, req, res) => {
+              console.error(`❌ Root proxy error (${detectedSiteName}):`, err.message);
+              if (!res.headersSent && !res.writableEnded) {
+                try {
+                  res.status(502).json({ error: "Proxy error", message: err.message });
+                } catch (e) {}
+              }
+            }
+          });
+          return siteProxy(req, res, next);
+        }
       }
-    }
-    
-    // If no referer or site doesn't match, try next middleware
-    next();
+      
+      // If no referer, try first enabled site as fallback
+      const firstEnabledSite = Object.values(allSites).find(s => s.neocore?.enabled);
+      if (firstEnabledSite) {
+        trackDirectRequest(firstEnabledSite, req, `Root route (fallback: ${firstEnabledSite.name})`);
+        const fallbackProxy = createProxyMiddleware({
+          target: firstEnabledSite.neocore.target,
+          changeOrigin: true,
+          ws: true,
+          xfwd: true,
+          secure: false,
+          timeout: 30000,
+          proxyTimeout: 30000
+        });
+        return fallbackProxy(req, res, next);
+      }
+      
+      next();
+    };
   };
   
   // Register root routes only once (for first site to avoid conflicts)
-  // Other sites will use site-specific paths
   const sitesArray = Object.values(allSites);
   const isFirstSite = sitesArray[0] && sitesArray[0].name === site.name;
   
   if (isFirstSite) {
-    // Register root-level routes that detect site from referer
+    const rootProxy = createRootProxy();
     app.use('/static', rootProxy);
     app.use('/api', rootProxy);
-    
-    // Root assets (images, icons, etc.)
     app.use(/^\/([^\/]+\.(png|svg|ico|jpg|jpeg|webp|gif|woff|woff2|ttf|eot|otf|css|js))$/, rootProxy);
-    
-    console.log(`✅ Registered root-level routes with site detection for ${site.name}`);
+    console.log(`✅ Registered root-level routes with multi-site detection`);
   }
   
   console.log(`✅ Registered direct routes for ${site.name}: /static/${site.name}/*, /api/${site.name}/*`);
