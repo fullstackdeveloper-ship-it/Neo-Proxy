@@ -206,14 +206,15 @@ function registerNeocoreRoutes(app, allSites, server) {
         
         // Handle proxy errors (including backend connection failures)
         proxy.on('error', (err, req, socket) => {
+          const wsTarget = site.neocore.wsTarget || site.neocore.target;
           const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
           if (!suppressErrors.includes(err.code)) {
             console.error(`   ❌ WebSocket proxy error (${site.name}):`, err.message);
-            console.error(`   Code: ${err.code}, Target: ${site.neocore.target}`);
+            console.error(`   Code: ${err.code}, Target: ${wsTarget}`);
             console.error(`   This usually means the backend is not reachable or not responding`);
           } else if (err.code === 'ECONNREFUSED') {
             // This is important - backend is not accepting connections
-            console.error(`   ⚠️  Backend connection refused (${site.name}): ${site.neocore.target}`);
+            console.error(`   ⚠️  Backend connection refused (${site.name}): ${wsTarget}`);
             console.error(`   Check if NeoCore backend is running and accessible`);
           }
           if (socket && !socket.destroyed) {
@@ -225,10 +226,11 @@ function registerNeocoreRoutes(app, allSites, server) {
         
         // Handle WebSocket proxy request (before connecting to backend)
         proxy.on('proxyReqWs', (proxyReq, req, socket) => {
-          // Set proper headers for WebSocket (critical for Socket.IO)
-          const targetUrl = new URL(site.neocore.target);
-          // Host header: For nginx on port 80, use hostname only (nginx handles port internally)
-          // But if port is explicitly specified and not 80, include it
+          // Use wsTarget if available (direct backend), otherwise use target (nginx)
+          const wsTarget = site.neocore.wsTarget || site.neocore.target;
+          const targetUrl = new URL(wsTarget);
+          
+          // Host header: Include port if not standard (80/443)
           const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
           const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
           
@@ -249,14 +251,25 @@ function registerNeocoreRoutes(app, allSites, server) {
           proxyReq.setHeader('Connection', 'Upgrade');
           proxyReq.setHeader('Upgrade', 'websocket');
           
-          console.log(`   🔗 Connecting to backend: ${site.neocore.target}${req.url}`);
+          console.log(`   🔗 Connecting to backend: ${wsTarget}${req.url}`);
           console.log(`   Host header: ${hostHeader} (port: ${port})`);
         });
         
         // Handle WebSocket upgrade success (connection to backend established)
         proxy.on('open', (proxySocket) => {
+          const wsTarget = site.neocore.wsTarget || site.neocore.target;
           console.log(`   ✅ WebSocket connection established to backend (${site.name})`);
           console.log(`   📡 Real-time data should now flow`);
+          console.log(`   🔗 Connected to: ${wsTarget}`);
+          
+          // Track data flow for debugging
+          let dataCount = 0;
+          proxySocket.on('data', (data) => {
+            dataCount++;
+            if (process.env.DEBUG || dataCount % 10 === 0) {
+              console.log(`   📥 Data received (${site.name}): ${data.length} bytes (total: ${dataCount} packets)`);
+            }
+          });
           
           // Ensure proxy socket stays alive and forwards data
           proxySocket.on('error', (err) => {
@@ -267,7 +280,7 @@ function registerNeocoreRoutes(app, allSites, server) {
           });
           
           proxySocket.on('close', () => {
-            console.log(`   🔌 Proxy socket closed (${site.name})`);
+            console.log(`   🔌 Proxy socket closed (${site.name}) after ${dataCount} data packets`);
           });
         });
         
@@ -285,6 +298,18 @@ function registerNeocoreRoutes(app, allSites, server) {
         proxy.on('upgrade', (res, socket, head) => {
           console.log(`   ⬆️  WebSocket upgrade response received (${site.name})`);
           console.log(`   Status: ${res.statusCode}`);
+          if (res.statusCode !== 101) {
+            console.error(`   ⚠️  Unexpected status code: ${res.statusCode} (expected 101)`);
+          }
+        });
+        
+        // Handle WebSocket error during upgrade
+        proxy.on('error', (err, req, socket) => {
+          const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+          if (!suppressErrors.includes(err.code)) {
+            console.error(`   ❌ WebSocket proxy error during upgrade (${site.name}):`, err.message);
+            console.error(`   Code: ${err.code}`);
+          }
         });
         
         wsProxies.set(site.name, proxy);
@@ -389,6 +414,7 @@ function registerNeocoreRoutes(app, allSites, server) {
               }
               
               // Track socket for debugging
+              let clientDataCount = 0;
               socket.on('error', (err) => {
                 const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
                 if (!suppressErrors.includes(err.code)) {
@@ -399,16 +425,17 @@ function registerNeocoreRoutes(app, allSites, server) {
               
               socket.on('close', (hadError) => {
                 if (hadError) {
-                  console.log(`   🔌 Client socket closed with error (${targetSite.name})`);
+                  console.log(`   🔌 Client socket closed with error (${targetSite.name}) after ${clientDataCount} packets`);
                 } else {
-                  console.log(`   🔌 Client socket closed normally (${targetSite.name})`);
+                  console.log(`   🔌 Client socket closed normally (${targetSite.name}) after ${clientDataCount} packets`);
                 }
               });
               
-              // Track data flow
+              // Track data flow from client
               socket.on('data', (data) => {
+                clientDataCount++;
                 if (process.env.DEBUG) {
-                  console.log(`   📥 Received data from client (${targetSite.name}): ${data.length} bytes`);
+                  console.log(`   📤 Sent data to backend (${targetSite.name}): ${data.length} bytes`);
                 }
               });
               
