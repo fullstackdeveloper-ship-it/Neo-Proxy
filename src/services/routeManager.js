@@ -197,9 +197,12 @@ function registerNeocoreRoutes(app, allSites, server) {
           ws: true,
           changeOrigin: true,
           secure: false,
-          timeout: 30000,
+          timeout: 0, // No timeout - keep connection alive
+          proxyTimeout: 0, // No proxy timeout
           xfwd: true, // Forward X-Forwarded-* headers
           // Don't rewrite path - keep /socket.io as is
+          // Ensure WebSocket frames are forwarded immediately without buffering
+          buffer: false, // Disable buffering for WebSocket
         });
         
         console.log(`   🔌 WebSocket proxy target for ${site.name}: ${wsTarget}`);
@@ -262,11 +265,22 @@ function registerNeocoreRoutes(app, allSites, server) {
           console.log(`   📡 Real-time data should now flow`);
           console.log(`   🔗 Connected to: ${wsTarget}`);
           
+          // Ensure socket is in flowing mode (not paused) for immediate data forwarding
+          proxySocket.resume();
+          
           // Track data flow for debugging
           let dataCount = 0;
           proxySocket.on('data', (data) => {
             dataCount++;
-            if (process.env.DEBUG || dataCount % 10 === 0) {
+            // Log first few packets to see Socket.IO handshake
+            if (dataCount <= 5) {
+              console.log(`   📥 Data received from backend (${site.name}): ${data.length} bytes (packet #${dataCount})`);
+              if (dataCount === 1) {
+                // Log first packet (Socket.IO handshake) for debugging
+                const preview = data.toString().substring(0, 150);
+                console.log(`   📋 First packet preview: ${preview}...`);
+              }
+            } else if (process.env.DEBUG || dataCount % 10 === 0) {
               console.log(`   📥 Data received (${site.name}): ${data.length} bytes (total: ${dataCount} packets)`);
             }
           });
@@ -281,6 +295,12 @@ function registerNeocoreRoutes(app, allSites, server) {
           
           proxySocket.on('close', () => {
             console.log(`   🔌 Proxy socket closed (${site.name}) after ${dataCount} data packets`);
+          });
+          
+          // Ensure socket doesn't get paused
+          proxySocket.on('pause', () => {
+            console.log(`   ⚠️  Proxy socket paused (${site.name}) - resuming...`);
+            proxySocket.resume();
           });
         });
         
@@ -434,9 +454,19 @@ function registerNeocoreRoutes(app, allSites, server) {
               // Track data flow from client
               socket.on('data', (data) => {
                 clientDataCount++;
-                if (process.env.DEBUG) {
-                  console.log(`   📤 Sent data to backend (${targetSite.name}): ${data.length} bytes`);
+                // Log first few packets to see Socket.IO handshake
+                if (clientDataCount <= 3 || process.env.DEBUG) {
+                  console.log(`   📤 Sent data to backend (${targetSite.name}): ${data.length} bytes (packet #${clientDataCount})`);
                 }
+              });
+              
+              // Ensure client socket is in flowing mode
+              socket.resume();
+              
+              // Prevent socket from being paused
+              socket.on('pause', () => {
+                console.log(`   ⚠️  Client socket paused (${targetSite.name}) - resuming...`);
+                socket.resume();
               });
               
               // Call proxy.ws() - target is already set in proxy configuration
