@@ -4,7 +4,7 @@
  */
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
-const { createDevicesProxy } = require("./proxyFactory");
+const { createDeviceProxy } = require("./proxyFactory");
 const { serveAsset, serveHTML } = require("./assetsService");
 const fs = require('fs');
 const path = require('path');
@@ -299,84 +299,26 @@ function registerNeocoreRoutes(app, allSites, server) {
 
 /**
  * Register device routes for all sites
+ * URL Structure: /vpn/{site}/devices/{deviceId}/*
  * Devices routes MUST be registered BEFORE neocore routes to avoid conflicts
  */
 function registerDevicesRoutes(app, allSites) {
-  // Register device routes for each site
+  // Register individual device routes for each site
   Object.values(allSites).forEach(site => {
-    if (site.devices?.enabled) {
-      const middlewares = createDevicesProxy(site);
-      if (middlewares) {
-        // Explicit /devices route - handles /vpn/site1/devices/*
-        app.use(`/vpn/${site.name}/devices`, ...middlewares);
-        console.log(`✅ Registered device proxy: /vpn/${site.name}/devices → ${site.devices.target} (SOCKS:${site.devices.socksPort})`);
-      }
-    }
-  });
-
-  // Device-specific file patterns - catch device files and route to devices
-  // This handles requests like /vpn/site1/status.shtml → /vpn/site1/devices/status.shtml
-  // Store device middlewares for pattern matching
-  const deviceMiddlewares = new Map();
-  Object.values(allSites).forEach(site => {
-    if (site.devices?.enabled) {
-      const middlewares = createDevicesProxy(site);
-      if (middlewares) {
-        deviceMiddlewares.set(site.name, middlewares);
-      }
-    }
-  });
-
-  // Device file pattern matcher - rewrites URL and applies device middlewares
-  Object.values(allSites).forEach(site => {
-    if (site.devices?.enabled) {
-      const middlewares = deviceMiddlewares.get(site.name);
-      if (middlewares) {
-        app.use(`/vpn/${site.name}`, (req, res, next) => {
-          const url = req.url;
-          
-          // Skip if already going to /devices or /neocore
-          if (url.startsWith('/devices') || url.startsWith('/neocore')) {
-            return next();
-          }
-          
-          // Skip common neocore static assets
-          if (url.startsWith('/static/') || 
-              url.match(/^\/main\.[^\/]+\.(js|css)$/) ||
-              url.match(/\.(png|jpg|jpeg|svg|ico|gif|webp|woff|woff2|ttf|eot)$/i)) {
-            return next();
-          }
-          
-          // Device file patterns - route to devices
-          const isDeviceRequest = 
-            url.match(/\.(shtml|cgi|xml|json)$/i) ||           // Device file extensions
-            url.match(/^\/(status|api|config|data|control|system|device)/i) ||  // Device paths
-            url.match(/^\/[^\/]+\.(shtml|cgi|xml|json)$/i);   // Files in root
-          
-          if (isDeviceRequest) {
-            // Rewrite to /devices path
-            const originalUrl = req.url;
-            req.url = `/devices${req.url}`;
-            console.log(`🔄 Device pattern match: ${originalUrl} → /vpn/${site.name}/devices${req.url}`);
-            
-            // Apply device middlewares (tunnelCheck + proxy)
-            // Execute middlewares sequentially
-            let index = 0;
-            const runNext = (err) => {
-              if (err) return next(err);
-              if (index < middlewares.length) {
-                middlewares[index++](req, res, runNext);
-              } else {
-                next();
-              }
-            };
-            runNext();
-            return;
-          }
-          
-          next();
-        });
-      }
+    if (site.devices?.enabled && site.devices.deviceList) {
+      // Register route for each device in deviceList
+      Object.entries(site.devices.deviceList).forEach(([deviceId, deviceConfig]) => {
+        const proxy = createDeviceProxy(site, deviceId, deviceConfig);
+        if (proxy) {
+          // Route: /vpn/{site}/devices/{deviceId}/*
+          app.use(`/vpn/${site.name}/devices/${deviceId}`, proxy);
+          console.log(`✅ Registered device: /vpn/${site.name}/devices/${deviceId} → ${deviceConfig.target} (${deviceConfig.name || deviceId})`);
+        } else {
+          console.error(`❌ Failed to create proxy for device: ${site.name}/devices/${deviceId}`);
+        }
+      });
+    } else if (site.devices?.enabled && !site.devices.deviceList) {
+      console.warn(`⚠️  Site ${site.name} has devices enabled but no deviceList configured`);
     }
   });
 }

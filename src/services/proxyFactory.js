@@ -1,25 +1,10 @@
 /**
  * Proxy Factory
  * Creates proxy middleware for neocore and devices
+ * Uses OpenVPN routing for device access (no SSH tunnels needed)
  */
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
-const { SocksProxyAgent } = require("socks-proxy-agent");
-
-/**
- * Create agent for SOCKS tunnel
- */
-function createSocksAgent(socksPort) {
-  try {
-    return new SocksProxyAgent(`socks5h://127.0.0.1:${socksPort}`, {
-      timeout: 30000,
-      keepAlive: true
-    });
-  } catch (err) {
-    console.error(`❌ Failed to create SOCKS agent:`, err.message);
-    return undefined;
-  }
-}
 
 /**
  * Request tracking utility
@@ -32,7 +17,11 @@ function trackRequest(site, service, req, status = 'start') {
   const ip = req.ip || req.connection.remoteAddress || 'unknown';
   
   if (status === 'start') {
-    console.log(`📥 [${timestamp}] ${method} ${url} | Site: ${site.name} | Service: ${service} | VPN IP: ${site.vpnIp} | Client: ${ip}`);
+    // For devices, virtual IP is in deviceConfig, not site
+    const ipInfo = service.startsWith('devices') 
+      ? `Service: ${service}` 
+      : `VPN IP: ${site.vpnIp}`;
+    console.log(`📥 [${timestamp}] ${method} ${url} | Site: ${site.name} | ${ipInfo} | Client: ${ip}`);
   } else if (status === 'success') {
     console.log(`✅ [${timestamp}] ${method} ${url} | Site: ${site.name} | Service: ${service} | Status: Success`);
   } else if (status === 'error') {
@@ -168,34 +157,21 @@ function createNeocoreProxy(site) {
 }
 
 /**
- * Create proxy for devices (via SOCKS tunnel)
+ * Create proxy for a specific device (via OpenVPN routing - direct access)
+ * According to SRS: Devices accessed via virtual IP (172.16.x.100) which is DNAT'd to actual device
+ * 
+ * @param {Object} site - Site configuration
+ * @param {string} deviceId - Device identifier (e.g., "device1")
+ * @param {Object} deviceConfig - Device configuration with virtualIp and target
+ * @returns {Object|null} Proxy middleware or null if invalid
  */
-function createDevicesProxy(site) {
-  if (!site.devices || !site.devices.enabled) return null;
-
-  // Middleware to check tunnel readiness
-  const tunnelCheck = (req, res, next) => {
-    if (!site.devices.tunnelReady) {
-      trackRequest(site, 'devices', req, 'error');
-      console.error(`⚠️  Tunnel not ready for ${site.name} (SOCKS:${site.devices.socksPort})`);
-      return res.status(503).json({
-        error: "SOCKS tunnel not ready",
-        message: "Please wait for tunnel to establish",
-        site: site.name,
-        service: "devices",
-        vpnIp: site.vpnIp,
-        socksPort: site.devices.socksPort,
-        retryAfter: 2
-      });
-    }
-    next();
-  };
+function createDeviceProxy(site, deviceId, deviceConfig) {
+  if (!deviceConfig || !deviceConfig.target) return null;
 
   const proxy = createProxyMiddleware({
-    target: site.devices.target,
+    target: deviceConfig.target,  // Virtual IP (e.g., 172.16.2.100) - DNAT'd to actual device
     changeOrigin: true,
     ws: true,
-    agent: createSocksAgent(site.devices.socksPort),
     xfwd: true,
     secure: false,
     timeout: 30000,
@@ -203,22 +179,22 @@ function createDevicesProxy(site) {
     // Suppress WebSocket ECONNRESET errors
     wsErrorHandler: (err, req, socket, head) => {
       if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
-        console.error(`⚠️  WebSocket error (${site.name}/devices):`, err.message);
+        console.error(`⚠️  WebSocket error (${site.name}/devices/${deviceId}):`, err.message);
       }
     },
 
     pathRewrite: {
-      [`^/vpn/${site.name}/devices`]: ""
+      [`^/vpn/${site.name}/devices/${deviceId}`]: ""
     },
 
     onError: (err, req, res) => {
       // Suppress ECONNRESET errors
       if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
-        trackRequest(site, 'devices', req, 'error');
-        console.error(`❌ Devices proxy error (${site.name}):`, err.message);
-        console.error(`   Target: ${site.devices.target}`);
+        trackRequest(site, `devices/${deviceId}`, req, 'error');
+        console.error(`❌ Device proxy error (${site.name}/devices/${deviceId}):`, err.message);
+        console.error(`   Target: ${deviceConfig.target} (Virtual IP)`);
         console.error(`   VPN IP: ${site.vpnIp}`);
-        console.error(`   SOCKS Port: ${site.devices.socksPort}`);
+        console.error(`   Virtual IP: ${deviceConfig.virtualIp || 'N/A'}`);
       }
       if (!res.headersSent && !res.writableEnded) {
         try {
@@ -226,30 +202,24 @@ function createDevicesProxy(site) {
             error: "Proxy error",
             message: err.message,
             site: site.name,
+            deviceId: deviceId,
             service: "devices",
-            target: site.devices.target,
+            target: deviceConfig.target,
             vpnIp: site.vpnIp,
-            socksPort: site.devices.socksPort
+            virtualIp: deviceConfig.virtualIp
           });
         } catch (e) {}
       }
     },
 
     onProxyReq: (proxyReq, req, res) => {
-      trackRequest(site, 'devices', req, 'start');
-      // Recreate agent if needed
-      if (site.devices.tunnelReady) {
-        const agent = createSocksAgent(site.devices.socksPort);
-        if (agent) {
-          proxyReq.agent = agent;
-        }
-      }
+      trackRequest(site, `devices/${deviceId}`, req, 'start');
       
       if (process.env.DEBUG) {
-        console.log(`   → Target: ${site.devices.target}`);
+        console.log(`   → Target: ${deviceConfig.target} (Virtual IP)`);
         console.log(`   → VPN IP: ${site.vpnIp}`);
-        console.log(`   → SOCKS Port: ${site.devices.socksPort}`);
-        console.log(`   → Tunnel Ready: ${site.devices.tunnelReady}`);
+        console.log(`   → Virtual IP: ${deviceConfig.virtualIp || 'N/A'}`);
+        console.log(`   → Device ID: ${deviceId}`);
         console.log(`   → Rewritten path: ${proxyReq.path}`);
       }
     },
@@ -280,7 +250,7 @@ function createDevicesProxy(site) {
       proxyRes.on("end", () => {
         try {
           const originalLength = body.length;
-          body = rewriteContent(body, site.name, req, 'devices');
+          body = rewriteContent(body, site.name, req, 'devices', deviceId);
           const newLength = body.length;
           
           if (process.env.DEBUG || originalLength !== newLength) {
@@ -291,11 +261,11 @@ function createDevicesProxy(site) {
             res.setHeader("content-type", contentType);
             res.setHeader("content-length", Buffer.byteLength(body));
             res.end(body);
-            trackRequest(site, 'devices', req, 'success');
+            trackRequest(site, `devices/${deviceId}`, req, 'success');
           }
         } catch (err) {
-          trackRequest(site, 'devices', req, 'error');
-          console.error(`❌ Error rewriting content (${site.name}/devices):`, err.message);
+          trackRequest(site, `devices/${deviceId}`, req, 'error');
+          console.error(`❌ Error rewriting content (${site.name}/devices/${deviceId}):`, err.message);
           console.error(`   Stack:`, err.stack);
           if (!res.headersSent && !res.writableEnded) {
             try {
@@ -308,8 +278,8 @@ function createDevicesProxy(site) {
       proxyRes.on("error", (err) => {
         // Suppress ECONNRESET errors
         if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') {
-          trackRequest(site, 'devices', req, 'error');
-          console.error(`❌ Proxy response error (${site.name}/devices):`, err.message);
+          trackRequest(site, `devices/${deviceId}`, req, 'error');
+          console.error(`❌ Proxy response error (${site.name}/devices/${deviceId}):`, err.message);
         }
         if (!res.headersSent && !res.writableEnded) {
           try {
@@ -320,19 +290,38 @@ function createDevicesProxy(site) {
     }
   });
 
-  return [tunnelCheck, proxy];
+  return proxy;
+}
+
+/**
+ * Legacy function for backward compatibility
+ * @deprecated Use createDeviceProxy(site, deviceId, deviceConfig) instead
+ */
+function createDevicesProxy(site) {
+  // This is kept for backward compatibility but should not be used
+  // New code should use createDeviceProxy with deviceList
+  console.warn(`⚠️  createDevicesProxy is deprecated. Use createDeviceProxy with deviceList instead.`);
+  return null;
 }
 
 /**
  * Rewrite HTML content to point to local assets and correct API paths
- * For devices: Rewrites all relative paths to include site prefix
+ * For devices: Rewrites all relative paths to include site and device prefix
  * For neocore: Rewrites main.js/css and API paths
+ * 
+ * @param {string} body - HTML content to rewrite
+ * @param {string} siteName - Site name (e.g., "site1")
+ * @param {Object} req - Express request object
+ * @param {string} serviceType - Service type: 'neocore' or 'devices'
+ * @param {string} deviceId - Device ID (required for devices, e.g., "device1")
  */
-function rewriteContent(body, siteName, req, serviceType = 'neocore') {
-  // Use full path including service type
+function rewriteContent(body, siteName, req, serviceType = 'neocore', deviceId = null) {
+  // Use full path including service type and device ID
   const sitePrefix = serviceType === 'neocore' 
     ? `/vpn/${siteName}/neocore`
-    : `/vpn/${siteName}/devices`;
+    : deviceId 
+      ? `/vpn/${siteName}/devices/${deviceId}`
+      : `/vpn/${siteName}/devices`;  // Fallback for legacy support
     
   // Track rewriting for debugging
   if (process.env.DEBUG) {
@@ -341,9 +330,10 @@ function rewriteContent(body, siteName, req, serviceType = 'neocore') {
   
   if (serviceType === 'devices') {
     // DEVICE-SPECIFIC REWRITING - Comprehensive path rewriting for device HTML
-    // Rewrite all relative paths to include /vpn/site/devices prefix
+    // Rewrite all relative paths to include /vpn/site/devices/deviceId prefix
     
-    console.log(`   🔄 Rewriting device HTML for ${siteName} (prefix: ${sitePrefix})`);
+    const deviceInfo = deviceId ? `device ${deviceId}` : 'devices';
+    console.log(`   🔄 Rewriting device HTML for ${siteName}/${deviceInfo} (prefix: ${sitePrefix})`);
     
     // Helper function to check if path should be skipped
     const shouldSkip = (path) => {
@@ -481,5 +471,6 @@ function rewriteContent(body, siteName, req, serviceType = 'neocore') {
 
 module.exports = {
   createNeocoreProxy,
-  createDevicesProxy
+  createDeviceProxy,
+  createDevicesProxy  // Deprecated, kept for backward compatibility
 };
