@@ -256,6 +256,31 @@ function registerNeocoreRoutes(app, allSites, server) {
     }
   });
 
+  // Root-level images/icons (detect site from referer)
+  app.get(/^\/([^\/]+\.(png|jpg|jpeg|svg|ico|gif|webp))$/, (req, res) => {
+    // Extract filename from URL path (remove leading slash)
+    const fileName = req.path.substring(1);
+    const site = detectSite(req, allSites) || Object.values(allSites).find(s => s.neocore?.enabled);
+    
+    if (!site) {
+      return res.status(404).json({ error: 'Site not found' });
+    }
+    
+    const assetPath = path.join(__dirname, '../build', fileName);
+    const ext = path.extname(fileName).toLowerCase();
+    const contentTypes = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.gif': 'image/gif', '.webp': 'image/webp'
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+    
+    if (!serveStaticFile(assetPath, res, contentType)) {
+      res.status(404).json({ error: 'Image not found' });
+    } else if (process.env.DEBUG) {
+      console.log(`📷 Served root image: /${fileName} → ${site.name} (from ${req.headers.referer || 'direct'})`);
+    }
+  });
+
   // Site-prefixed static assets
   app.get('/vpn/:siteName/neocore/static/:type/:fileName', (req, res) => {
     const site = allSites[req.params.siteName];
