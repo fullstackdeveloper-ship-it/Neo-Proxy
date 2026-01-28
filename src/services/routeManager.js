@@ -221,10 +221,25 @@ function registerNeocoreRoutes(app, allSites, server) {
         
         // Handle WebSocket proxy request (before connecting to backend)
         proxy.on('proxyReqWs', (proxyReq, req, socket) => {
-          // Set proper headers for WebSocket
+          // Set proper headers for WebSocket (critical for Socket.IO)
+          const targetUrl = new URL(site.neocore.target);
+          // Host header should be hostname:port (e.g., "10.9.0.5:80")
+          const hostHeader = targetUrl.port ? `${targetUrl.hostname}:${targetUrl.port}` : targetUrl.hostname;
+          proxyReq.setHeader('Host', hostHeader); // Critical: Socket.IO needs correct Host header
           proxyReq.setHeader('X-Forwarded-Proto', 'ws');
-          proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || '');
+          proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || req.headers['x-forwarded-for'] || '');
+          proxyReq.setHeader('X-Real-IP', req.socket.remoteAddress || '');
+          
+          // Preserve original headers that Socket.IO might need
+          if (req.headers.origin) {
+            proxyReq.setHeader('Origin', req.headers.origin);
+          }
+          if (req.headers.cookie) {
+            proxyReq.setHeader('Cookie', req.headers.cookie);
+          }
+          
           console.log(`   🔗 Connecting to backend: ${site.neocore.target}${req.url}`);
+          console.log(`   Host header: ${hostHeader}`);
         });
         
         // Handle WebSocket upgrade success (connection to backend established)
@@ -323,20 +338,37 @@ function registerNeocoreRoutes(app, allSites, server) {
             
             // Manually proxy the upgrade - this prevents middleware from also handling it
             try {
-              // Ensure proper headers are set
+              // Ensure proper headers are set on the request
+              const targetUrl = new URL(targetSite.neocore.target);
+              // Host header should be hostname:port
+              const hostHeader = targetUrl.port ? `${targetUrl.hostname}:${targetUrl.port}` : targetUrl.hostname;
+              req.headers['host'] = hostHeader; // Critical for Socket.IO
               req.headers['x-forwarded-proto'] = 'ws';
-              req.headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+              req.headers['x-forwarded-for'] = req.socket.remoteAddress || req.headers['x-forwarded-for'] || '';
+              req.headers['x-real-ip'] = req.socket.remoteAddress || '';
               
               // Track socket for debugging
               socket.on('error', (err) => {
                 const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
                 if (!suppressErrors.includes(err.code)) {
                   console.error(`   ❌ Client socket error (${targetSite.name}):`, err.message);
+                  console.error(`   Error code: ${err.code}`);
                 }
               });
               
-              socket.on('close', () => {
-                console.log(`   🔌 Client socket closed (${targetSite.name})`);
+              socket.on('close', (hadError) => {
+                if (hadError) {
+                  console.log(`   🔌 Client socket closed with error (${targetSite.name})`);
+                } else {
+                  console.log(`   🔌 Client socket closed normally (${targetSite.name})`);
+                }
+              });
+              
+              // Track data flow
+              socket.on('data', (data) => {
+                if (process.env.DEBUG) {
+                  console.log(`   📥 Received data from client (${targetSite.name}): ${data.length} bytes`);
+                }
               });
               
               // Call proxy.ws() - target is already set in proxy configuration

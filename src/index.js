@@ -50,6 +50,89 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Backend connectivity test endpoint
+app.get("/test-backend/:siteName", async (req, res) => {
+  const siteName = req.params.siteName;
+  const site = SITES[siteName];
+  
+  if (!site || !site.neocore?.enabled) {
+    return res.status(404).json({ error: "Site not found or not enabled" });
+  }
+  
+  const http = require('http');
+  const url = require('url');
+  const targetUrl = url.parse(site.neocore.target);
+  
+  // Test HTTP connectivity
+  const testHttp = () => {
+    return new Promise((resolve) => {
+      const options = {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || 80,
+        path: '/api/health',
+        method: 'GET',
+        timeout: 5000
+      };
+      
+      const req = http.request(options, (res) => {
+        resolve({ success: true, statusCode: res.statusCode });
+      });
+      
+      req.on('error', (err) => {
+        resolve({ success: false, error: err.message, code: err.code });
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ success: false, error: 'Connection timeout' });
+      });
+      
+      req.end();
+    });
+  };
+  
+  // Test WebSocket endpoint (socket.io polling)
+  const testSocketIO = () => {
+    return new Promise((resolve) => {
+      const options = {
+        hostname: targetUrl.hostname,
+        port: targetUrl.port || 80,
+        path: '/socket.io/?EIO=4&transport=polling',
+        method: 'GET',
+        timeout: 5000
+      };
+      
+      const req = http.request(options, (res) => {
+        resolve({ success: true, statusCode: res.statusCode });
+      });
+      
+      req.on('error', (err) => {
+        resolve({ success: false, error: err.message, code: err.code });
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ success: false, error: 'Connection timeout' });
+      });
+      
+      req.end();
+    });
+  };
+  
+  const [httpTest, socketIOTest] = await Promise.all([testHttp(), testSocketIO()]);
+  
+  res.json({
+    site: siteName,
+    target: site.neocore.target,
+    vpnIp: site.vpnIp,
+    tests: {
+      http: httpTest,
+      socketIO: socketIOTest
+    },
+    status: httpTest.success && socketIOTest.success ? 'healthy' : 'unhealthy'
+  });
+});
+
 // Graceful shutdown
 const shutdown = () => {
   console.log("🛑 Shutting down gracefully...");
