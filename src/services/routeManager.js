@@ -266,26 +266,10 @@ function registerNeocoreRoutes(app, allSites, server) {
           console.log(`   🔗 Connected to: ${wsTarget}`);
           
           // Ensure socket is in flowing mode (not paused) for immediate data forwarding
+          // DO NOT add 'data' event handlers - let http-proxy handle WebSocket frames automatically
           proxySocket.resume();
           
-          // Track data flow for debugging
-          let dataCount = 0;
-          proxySocket.on('data', (data) => {
-            dataCount++;
-            // Log first few packets to see Socket.IO handshake
-            if (dataCount <= 5) {
-              console.log(`   📥 Data received from backend (${site.name}): ${data.length} bytes (packet #${dataCount})`);
-              if (dataCount === 1) {
-                // Log first packet (Socket.IO handshake) for debugging
-                const preview = data.toString().substring(0, 150);
-                console.log(`   📋 First packet preview: ${preview}...`);
-              }
-            } else if (process.env.DEBUG || dataCount % 10 === 0) {
-              console.log(`   📥 Data received (${site.name}): ${data.length} bytes (total: ${dataCount} packets)`);
-            }
-          });
-          
-          // Ensure proxy socket stays alive and forwards data
+          // Only track errors and close events - don't interfere with data flow
           proxySocket.on('error', (err) => {
             const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
             if (!suppressErrors.includes(err.code)) {
@@ -294,13 +278,7 @@ function registerNeocoreRoutes(app, allSites, server) {
           });
           
           proxySocket.on('close', () => {
-            console.log(`   🔌 Proxy socket closed (${site.name}) after ${dataCount} data packets`);
-          });
-          
-          // Ensure socket doesn't get paused
-          proxySocket.on('pause', () => {
-            console.log(`   ⚠️  Proxy socket paused (${site.name}) - resuming...`);
-            proxySocket.resume();
+            console.log(`   🔌 Proxy socket closed (${site.name})`);
           });
         });
         
@@ -433,8 +411,8 @@ function registerNeocoreRoutes(app, allSites, server) {
                 req.headers['upgrade'] = 'websocket';
               }
               
-              // Track socket for debugging
-              let clientDataCount = 0;
+              // Track socket for debugging - DO NOT add 'data' handlers
+              // Adding data handlers interferes with http-proxy's WebSocket frame forwarding
               socket.on('error', (err) => {
                 const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
                 if (!suppressErrors.includes(err.code)) {
@@ -445,31 +423,17 @@ function registerNeocoreRoutes(app, allSites, server) {
               
               socket.on('close', (hadError) => {
                 if (hadError) {
-                  console.log(`   🔌 Client socket closed with error (${targetSite.name}) after ${clientDataCount} packets`);
+                  console.log(`   🔌 Client socket closed with error (${targetSite.name})`);
                 } else {
-                  console.log(`   🔌 Client socket closed normally (${targetSite.name}) after ${clientDataCount} packets`);
-                }
-              });
-              
-              // Track data flow from client
-              socket.on('data', (data) => {
-                clientDataCount++;
-                // Log first few packets to see Socket.IO handshake
-                if (clientDataCount <= 3 || process.env.DEBUG) {
-                  console.log(`   📤 Sent data to backend (${targetSite.name}): ${data.length} bytes (packet #${clientDataCount})`);
+                  console.log(`   🔌 Client socket closed normally (${targetSite.name})`);
                 }
               });
               
               // Ensure client socket is in flowing mode
               socket.resume();
               
-              // Prevent socket from being paused
-              socket.on('pause', () => {
-                console.log(`   ⚠️  Client socket paused (${targetSite.name}) - resuming...`);
-                socket.resume();
-              });
-              
               // Call proxy.ws() - target is already set in proxy configuration
+              // Let http-proxy handle all WebSocket frame forwarding automatically
               proxy.ws(req, socket, head);
               
               console.log(`   🔗 WebSocket upgrade initiated - waiting for backend connection...`);
