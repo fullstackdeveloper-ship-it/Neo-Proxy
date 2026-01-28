@@ -415,14 +415,44 @@ function registerNeocoreRoutes(app, allSites, server) {
             xfwd: true
           });
           
-          // Set proper headers
-          const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
-          const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
+          // CRITICAL: Set headers in proxyReqWs handler (before upgrade request is sent)
+          proxy.on('proxyReqWs', (proxyReq, req, socket) => {
+            // Host header: Include port if not standard (80/443)
+            const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
+            const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
+            
+            // Set headers on the actual proxy request (not req.headers)
+            proxyReq.setHeader('Host', hostHeader); // CRITICAL: Socket.IO needs correct Host header
+            proxyReq.setHeader('X-Forwarded-Proto', targetUrl.protocol === 'https:' ? 'wss' : 'ws');
+            proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || req.headers['x-forwarded-for'] || '');
+            proxyReq.setHeader('X-Real-IP', req.socket.remoteAddress || '');
+            
+            // Preserve original headers that Socket.IO might need
+            if (req.headers.origin) {
+              proxyReq.setHeader('Origin', req.headers.origin);
+            }
+            if (req.headers.cookie) {
+              proxyReq.setHeader('Cookie', req.headers.cookie);
+            }
+            
+            // Set Connection and Upgrade headers explicitly for WebSocket
+            proxyReq.setHeader('Connection', 'Upgrade');
+            proxyReq.setHeader('Upgrade', 'websocket');
+            
+            console.log(`   🔗 Connecting to backend: ${wsTarget}${req.url}`);
+            console.log(`   Host header: ${hostHeader} (port: ${port})`);
+          });
           
-          req.headers['host'] = hostHeader;
-          req.headers['x-forwarded-proto'] = targetUrl.protocol === 'https:' ? 'wss' : 'ws';
-          req.headers['x-forwarded-for'] = req.socket.remoteAddress || '';
-          req.headers['x-real-ip'] = req.socket.remoteAddress || '';
+          // Handle upgrade response from backend
+          proxy.on('upgrade', (res, socket, head) => {
+            console.log(`   ⬆️  WebSocket upgrade response received (${targetSite.name})`);
+            console.log(`   Status: ${res.statusCode}`);
+            if (res.statusCode !== 101) {
+              console.error(`   ⚠️  Unexpected status code: ${res.statusCode} (expected 101)`);
+            } else {
+              console.log(`   ✅ Upgrade successful - WebSocket protocol established`);
+            }
+          });
           
           // Ensure socket is in flowing mode
           socket.resume();
@@ -432,6 +462,7 @@ function registerNeocoreRoutes(app, allSites, server) {
             const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
             if (!suppressErrors.includes(err.code)) {
               console.error(`   ❌ WebSocket proxy error (${targetSite.name}):`, err.message);
+              console.error(`   Code: ${err.code}`);
             }
             if (socket && !socket.destroyed) {
               try {
@@ -440,10 +471,11 @@ function registerNeocoreRoutes(app, allSites, server) {
             }
           });
           
-          // Handle successful upgrade
+          // Handle successful backend connection
           proxy.on('open', (proxySocket) => {
             console.log(`   ✅ WebSocket connection established to backend (${targetSite.name})`);
             console.log(`   📡 Real-time data should now flow`);
+            // Ensure proxy socket is in flowing mode
             proxySocket.resume();
           });
           
@@ -457,7 +489,10 @@ function registerNeocoreRoutes(app, allSites, server) {
             console.log(`   🔗 WebSocket upgrade initiated`);
           } catch (err) {
             console.error(`   ❌ Failed to proxy WebSocket:`, err.message);
-            socket.destroy();
+            console.error(`   Stack:`, err.stack);
+            if (!socket.destroyed) {
+              socket.destroy();
+            }
           }
           
           return; // Stop event propagation
