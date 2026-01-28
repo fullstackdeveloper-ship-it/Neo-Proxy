@@ -153,18 +153,15 @@ function registerNeocoreRoutes(app, allSites, server) {
 
   // URL rewrite interceptors (for HTTP requests - socket.io polling, API calls)
   app.use((req, res, next) => {
-    // Only intercept socket.io and API requests without site prefix
-    if ((req.url.startsWith('/socket.io') || req.url.startsWith('/api')) && !req.url.startsWith('/vpn/')) {
+    // Only intercept API requests without site prefix
+    // IMPORTANT: Do NOT rewrite /socket.io here. Express mounts strip prefixes (e.g. '/socket.io' -> '/'),
+    // and doing it in two places causes subtle path/query bugs that break Engine.IO.
+    if (req.url.startsWith('/api') && !req.url.startsWith('/vpn/')) {
       const site = detectSite(req, allSites);
       if (site?.neocore?.enabled) {
         const prefix = `/vpn/${site.name}/neocore`;
-        if (req.url.startsWith('/socket.io')) {
-          req.url = `${prefix}/socket.io${req.url.substring(11)}`;
-          console.log(`🔄 Socket.io rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
-        } else if (req.url.startsWith('/api')) {
-          req.url = `${prefix}/api${req.url.substring(4)}`;
-          console.log(`🔄 API rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
-        }
+        req.url = `${prefix}${req.url}`;
+        console.log(`🔄 API rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
       } else {
         console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
       }
