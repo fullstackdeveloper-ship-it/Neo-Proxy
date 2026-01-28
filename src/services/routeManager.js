@@ -200,12 +200,17 @@ function registerNeocoreRoutes(app, allSites, server) {
           // Don't rewrite path - keep /socket.io as is
         });
         
-        // Handle proxy errors
+        // Handle proxy errors (including backend connection failures)
         proxy.on('error', (err, req, socket) => {
           const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
           if (!suppressErrors.includes(err.code)) {
             console.error(`   ❌ WebSocket proxy error (${site.name}):`, err.message);
             console.error(`   Code: ${err.code}, Target: ${site.neocore.target}`);
+            console.error(`   This usually means the backend is not reachable or not responding`);
+          } else if (err.code === 'ECONNREFUSED') {
+            // This is important - backend is not accepting connections
+            console.error(`   ⚠️  Backend connection refused (${site.name}): ${site.neocore.target}`);
+            console.error(`   Check if NeoCore backend is running and accessible`);
           }
           if (socket && !socket.destroyed) {
             try {
@@ -214,28 +219,28 @@ function registerNeocoreRoutes(app, allSites, server) {
           }
         });
         
-        // Handle successful WebSocket upgrade
+        // Handle WebSocket proxy request (before connecting to backend)
         proxy.on('proxyReqWs', (proxyReq, req, socket) => {
           // Set proper headers for WebSocket
           proxyReq.setHeader('X-Forwarded-Proto', 'ws');
           proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || '');
-          if (process.env.DEBUG) {
-            console.log(`   🔗 WebSocket proxy request: ${req.url} → ${site.neocore.target}${req.url}`);
-          }
+          console.log(`   🔗 Connecting to backend: ${site.neocore.target}${req.url}`);
         });
         
-        // Handle WebSocket upgrade success
+        // Handle WebSocket upgrade success (connection to backend established)
         proxy.on('open', (proxySocket) => {
-          if (process.env.DEBUG) {
-            console.log(`   ✅ WebSocket connection established for ${site.name}`);
-          }
+          console.log(`   ✅ WebSocket connection established to backend (${site.name})`);
+          console.log(`   📡 Real-time data should now flow`);
         });
         
         // Handle WebSocket close
         proxy.on('close', (res, socket, head) => {
-          if (process.env.DEBUG) {
-            console.log(`   🔌 WebSocket connection closed for ${site.name}`);
-          }
+          console.log(`   🔌 WebSocket connection closed (${site.name})`);
+        });
+        
+        // Handle WebSocket proxy response (backend responded)
+        proxy.on('proxyRes', (proxyRes, req, res) => {
+          console.log(`   📥 Backend response: ${proxyRes.statusCode} (${site.name})`);
         });
         
         wsProxies.set(site.name, proxy);
@@ -322,16 +327,26 @@ function registerNeocoreRoutes(app, allSites, server) {
               req.headers['x-forwarded-proto'] = 'ws';
               req.headers['x-forwarded-for'] = req.socket.remoteAddress || '';
               
+              // Track socket for debugging
+              socket.on('error', (err) => {
+                const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
+                if (!suppressErrors.includes(err.code)) {
+                  console.error(`   ❌ Client socket error (${targetSite.name}):`, err.message);
+                }
+              });
+              
+              socket.on('close', () => {
+                console.log(`   🔌 Client socket closed (${targetSite.name})`);
+              });
+              
               // Call proxy.ws() - target is already set in proxy configuration
               proxy.ws(req, socket, head);
               
-              console.log(`   🔗 WebSocket upgrade initiated for ${targetSite.name}`);
+              console.log(`   🔗 WebSocket upgrade initiated - waiting for backend connection...`);
             } catch (err) {
-              const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
-              if (!suppressErrors.includes(err.code)) {
-                console.error(`   ❌ WebSocket proxy error:`, err.message);
-                console.error(`   Stack:`, err.stack);
-              }
+              console.error(`   ❌ Failed to initiate WebSocket proxy:`, err.message);
+              console.error(`   Error code: ${err.code}`);
+              console.error(`   Stack:`, err.stack);
               if (!socket.destroyed) {
                 try {
                   socket.destroy();
