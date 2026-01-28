@@ -183,15 +183,41 @@ function registerNeocoreRoutes(app, allSites, server) {
     res.status(404).json({ error: 'Socket.io endpoint not found - no site detected' });
   });
 
-  // WebSocket upgrade handler - Rewrite URLs, let middleware handle the upgrade
-  // http-proxy-middleware with ws:true automatically handles upgrades for registered routes
-  // We just rewrite /socket.io/ to /vpn/{site}/neocore/socket.io/ and let middleware handle it
+  // WebSocket upgrade handler - Manually handle upgrades for /socket.io without site prefix
+  // Create reusable proxy instances per site to avoid conflicts
   if (server && socketProxies.size > 0) {
-    // Track if we've already handled an upgrade to prevent double handling
+    // Create reusable proxy instances for each site
+    const wsProxies = new Map();
+    Object.values(allSites).forEach(site => {
+      if (site.neocore?.enabled) {
+        const proxy = httpProxy.createProxyServer({
+          target: site.neocore.target,
+          ws: true,
+          changeOrigin: true,
+          secure: false,
+          timeout: 30000
+        });
+        
+        proxy.on('error', (err, req, socket) => {
+          const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+          if (!suppressErrors.includes(err.code)) {
+            console.error(`   ❌ WebSocket proxy error (${site.name}):`, err.message);
+          }
+          if (socket && !socket.destroyed) {
+            try {
+              socket.destroy();
+            } catch (e) {}
+          }
+        });
+        
+        wsProxies.set(site.name, proxy);
+      }
+    });
+    
+    // Track handled upgrades to prevent double handling
     const handledUpgrades = new WeakSet();
     
     // Add upgrade listener that runs FIRST (before middleware handlers)
-    // Use prependListener to ensure i  t runs before middleware's handlers
     server.prependListener('upgrade', (req, socket, head) => {
       // Prevent double handling
       if (handledUpgrades.has(req)) {
@@ -200,7 +226,7 @@ function registerNeocoreRoutes(app, allSites, server) {
       
       let url = req.url || '';
       
-      // Only rewrite socket.io URLs without site prefix
+      // Only handle socket.io URLs without site prefix (let middleware handle prefixed ones)
       if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
         const origin = req.headers.origin || '';
         const referer = req.headers.referer || '';
@@ -208,7 +234,6 @@ function registerNeocoreRoutes(app, allSites, server) {
         
         console.log(`🔌 WebSocket upgrade: ${url}`);
         console.log(`   Cookie: ${cookieHeader}`);
-        console.log(`   Origin: ${origin}, Referer: ${referer}`);
         
         let targetSite = null;
         
@@ -252,34 +277,29 @@ function registerNeocoreRoutes(app, allSites, server) {
         }
         
         if (targetSite?.neocore?.enabled) {
-          // Rewrite URL and manually proxy the upgrade
-          const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-          const newUrl = `/socket.io${queryString}`; // Path after rewrite (removes /vpn/site/neocore prefix)
-          req.url = newUrl;
-          handledUpgrades.add(req);
-          
-          console.log(`   ✅ Rewritten: ${url} → ${newUrl} (site: ${targetSite.name}, target: ${targetSite.neocore.target})`);
-          
-          // Manually proxy the upgrade using http-proxy
-          const proxy = httpProxy.createProxyServer({
-            target: targetSite.neocore.target,
-            ws: true,
-            changeOrigin: true,
-            secure: false
-          });
-          
-          proxy.on('error', (err, req, socket) => {
-            const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
-            if (!suppressErrors.includes(err.code)) {
-              console.error(`   ❌ WebSocket proxy error (${targetSite.name}):`, err.message);
+          const proxy = wsProxies.get(targetSite.name);
+          if (proxy) {
+            handledUpgrades.add(req);
+            console.log(`   ✅ Proxying WebSocket to ${targetSite.name} (${targetSite.neocore.target})`);
+            
+            // Manually proxy the upgrade - this prevents middleware from also handling it
+            try {
+              proxy.ws(req, socket, head);
+            } catch (err) {
+              const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+              if (!suppressErrors.includes(err.code)) {
+                console.error(`   ❌ WebSocket proxy error:`, err.message);
+              }
+              if (!socket.destroyed) {
+                socket.destroy();
+              }
             }
-            if (!socket.destroyed) {
-              socket.destroy();
-            }
-          });
-          
-          proxy.ws(req, socket, head);
-          return; // Don't let other handlers process this
+            return; // Stop event propagation - don't let middleware handle this
+          } else {
+            console.error(`   ❌ Proxy not found for site: ${targetSite.name}`);
+            socket.destroy();
+            return;
+          }
         } else {
           console.error(`   ❌ No site detected, closing connection`);
           console.error(`   Available sites: ${Object.keys(allSites).join(', ')}`);
@@ -287,7 +307,7 @@ function registerNeocoreRoutes(app, allSites, server) {
           return;
         }
       }
-      // For URLs with site prefix, let middleware handle it
+      // For URLs with site prefix, let middleware handle it naturally
     });
     
     console.log(`✅ WebSocket URL rewrite handler registered (middleware will handle upgrades)`);
