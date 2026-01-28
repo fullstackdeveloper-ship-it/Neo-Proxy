@@ -52,7 +52,10 @@ function createProxy(target, pathRewrite, siteName) {
   return createProxyMiddleware({
     target,
     changeOrigin: true,
-    ws: true, // Enable WebSocket support
+    // IMPORTANT: Do NOT enable ws here.
+    // WebSocket upgrades are handled centrally in registerNeocoreRoutes() via server.on('upgrade')
+    // to avoid double-handling and "Invalid frame header".
+    ws: false,
     xfwd: true,
     secure: false,
     timeout: 30000,

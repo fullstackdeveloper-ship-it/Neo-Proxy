@@ -38,7 +38,9 @@ function createNeocoreProxy(site) {
   const proxy = createProxyMiddleware({
     target: site.neocore.target,
     changeOrigin: true,
-    ws: true,
+    // IMPORTANT: keep HTTP-only here; the main vpn-proxy service handles neocore Socket.IO
+    // upgrades centrally to avoid double upgrade handlers and frame corruption.
+    ws: false,
     xfwd: true,
     secure: false,
     timeout: 30000,
@@ -171,7 +173,10 @@ function createDeviceProxy(site, deviceId, deviceConfig) {
   const proxy = createProxyMiddleware({
     target: deviceConfig.target,  // Virtual IP (e.g., 172.16.2.100) - DNAT'd to actual device
     changeOrigin: true,
-    ws: true,
+    // IMPORTANT: keep HTTP-only unless we explicitly support device websockets.
+    // This prevents http-proxy-middleware from registering global upgrade listeners
+    // that can conflict with neocore Socket.IO upgrades.
+    ws: false,
     xfwd: true,
     secure: false,
     timeout: 30000,
