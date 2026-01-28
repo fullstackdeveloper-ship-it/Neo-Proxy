@@ -59,8 +59,9 @@ function createProxy(target, pathRewrite, siteName) {
     pathRewrite,
     logLevel: 'warn', // Reduce noise
     wsErrorHandler: (err, req, socket) => {
-      // Suppress common WebSocket errors (normal disconnects)
-      if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && err.code !== 'ECONNREFUSED') {
+      // Suppress common WebSocket errors (normal disconnects and stream conflicts)
+      const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+      if (!suppressErrors.includes(err.code)) {
         console.error(`⚠️  WebSocket error (${siteName}):`, err.message);
       }
     },
@@ -185,38 +186,58 @@ function registerNeocoreRoutes(app, allSites, server) {
   // http-proxy-middleware with ws:true automatically handles upgrades for registered routes
   // We just rewrite /socket.io/ to /vpn/{site}/neocore/socket.io/ and let middleware handle it
   if (server && socketProxies.size > 0) {
+    // Track if we've already handled an upgrade to prevent double handling
+    const handledUpgrades = new WeakSet();
+    
     // Add upgrade listener that runs FIRST (before middleware handlers)
     // Use prependListener to ensure it runs before middleware's handlers
     server.prependListener('upgrade', (req, socket, head) => {
+      // Prevent double handling
+      if (handledUpgrades.has(req)) {
+        return;
+      }
+      
       let url = req.url || '';
       
       // Only rewrite socket.io URLs without site prefix
       if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
         const origin = req.headers.origin || '';
         const referer = req.headers.referer || '';
+        const cookieHeader = req.headers.cookie || '';
         
         console.log(`🔌 WebSocket upgrade: ${url}`);
         console.log(`   Origin: ${origin}, Referer: ${referer}`);
         
-        // Detect site
-        const site = detectSite(req, allSites);
-        let targetSite = site;
+        // Detect site - try multiple methods
+        let targetSite = detectSite(req, allSites);
         
-        if (!targetSite?.neocore?.enabled) {
-          // Try referer
-          if (referer) {
-            const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
-            if (refererMatch) {
-              targetSite = allSites[refererMatch[1]];
+        // If not detected, try cookie (most reliable for WebSocket)
+        if (!targetSite?.neocore?.enabled && cookieHeader) {
+          const cookieMatch = cookieHeader.match(/vpn-site=([^;]+)/);
+          if (cookieMatch) {
+            targetSite = allSites[cookieMatch[1]];
+            if (targetSite?.neocore?.enabled) {
+              console.log(`   🍪 Detected site from cookie: ${targetSite.name}`);
             }
           }
-          
-          // Fallback to first site
-          if (!targetSite?.neocore?.enabled) {
-            targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
-            if (targetSite) {
-              console.log(`   ⚠️  Using fallback: ${targetSite.name}`);
+        }
+        
+        // If still not detected, try referer
+        if (!targetSite?.neocore?.enabled && referer) {
+          const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
+          if (refererMatch) {
+            targetSite = allSites[refererMatch[1]];
+            if (targetSite?.neocore?.enabled) {
+              console.log(`   📄 Detected site from referer: ${targetSite.name}`);
             }
+          }
+        }
+        
+        // Last resort: fallback to first enabled site
+        if (!targetSite?.neocore?.enabled) {
+          targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
+          if (targetSite) {
+            console.log(`   ⚠️  Using fallback: ${targetSite.name}`);
           }
         }
         
@@ -225,10 +246,12 @@ function registerNeocoreRoutes(app, allSites, server) {
           const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
           url = `/vpn/${targetSite.name}/neocore/socket.io${queryString}`;
           req.url = url;
+          handledUpgrades.add(req);
           console.log(`   ✅ Rewritten to: ${url} → ${targetSite.name}`);
         } else {
           console.error(`   ❌ No site detected, closing connection`);
           socket.destroy();
+          return;
         }
       }
       // Let the request continue - middleware will handle the upgrade for matching routes

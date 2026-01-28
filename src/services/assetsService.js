@@ -84,6 +84,14 @@ function serveHTML(req, res, siteName) {
       } else {
         html = html.replace(/<base[^>]*>/, `<base href="${basePath}/">`);
       }
+      
+      // Set cookie to track site for WebSocket connections
+      res.cookie('vpn-site', siteName, {
+        httpOnly: false, // Allow JavaScript to read it if needed
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        path: '/',
+        sameSite: 'lax'
+      });
     }
     
     res.setHeader('Content-Type', 'text/html');

@@ -4,6 +4,7 @@
 
 const express = require("express");
 const http = require("http");
+const cookieParser = require("cookie-parser");
 const SITES = require("./config/sites");
 const { registerAllRoutes } = require("./services/routeManager");
 
@@ -12,6 +13,9 @@ const server = http.createServer(app);
 
 // Attach server to app for WebSocket support
 app.set('server', server);
+
+// Cookie parser middleware (for site tracking)
+app.use(cookieParser());
 
 // Request logging
 app.use((req, res, next) => {
