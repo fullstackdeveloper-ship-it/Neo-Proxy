@@ -195,18 +195,46 @@ function registerNeocoreRoutes(app, allSites, server) {
           ws: true,
           changeOrigin: true,
           secure: false,
-          timeout: 30000
+          timeout: 30000,
+          xfwd: true, // Forward X-Forwarded-* headers
+          // Don't rewrite path - keep /socket.io as is
         });
         
+        // Handle proxy errors
         proxy.on('error', (err, req, socket) => {
           const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
           if (!suppressErrors.includes(err.code)) {
             console.error(`   ❌ WebSocket proxy error (${site.name}):`, err.message);
+            console.error(`   Code: ${err.code}, Target: ${site.neocore.target}`);
           }
           if (socket && !socket.destroyed) {
             try {
               socket.destroy();
             } catch (e) {}
+          }
+        });
+        
+        // Handle successful WebSocket upgrade
+        proxy.on('proxyReqWs', (proxyReq, req, socket) => {
+          // Set proper headers for WebSocket
+          proxyReq.setHeader('X-Forwarded-Proto', 'ws');
+          proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || '');
+          if (process.env.DEBUG) {
+            console.log(`   🔗 WebSocket proxy request: ${req.url} → ${site.neocore.target}${req.url}`);
+          }
+        });
+        
+        // Handle WebSocket upgrade success
+        proxy.on('open', (proxySocket) => {
+          if (process.env.DEBUG) {
+            console.log(`   ✅ WebSocket connection established for ${site.name}`);
+          }
+        });
+        
+        // Handle WebSocket close
+        proxy.on('close', (res, socket, head) => {
+          if (process.env.DEBUG) {
+            console.log(`   🔌 WebSocket connection closed for ${site.name}`);
           }
         });
         
@@ -280,18 +308,34 @@ function registerNeocoreRoutes(app, allSites, server) {
           const proxy = wsProxies.get(targetSite.name);
           if (proxy) {
             handledUpgrades.add(req);
-            console.log(`   ✅ Proxying WebSocket to ${targetSite.name} (${targetSite.neocore.target})`);
+            
+            // Ensure URL is correct (should be /socket.io/...)
+            // Don't modify req.url - keep it as /socket.io/... for backend
+            const originalUrl = req.url;
+            
+            console.log(`   ✅ Proxying WebSocket to ${targetSite.name}`);
+            console.log(`   Target: ${targetSite.neocore.target}${originalUrl}`);
             
             // Manually proxy the upgrade - this prevents middleware from also handling it
             try {
+              // Ensure proper headers are set
+              req.headers['x-forwarded-proto'] = 'ws';
+              req.headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+              
+              // Call proxy.ws() - target is already set in proxy configuration
               proxy.ws(req, socket, head);
+              
+              console.log(`   🔗 WebSocket upgrade initiated for ${targetSite.name}`);
             } catch (err) {
               const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
               if (!suppressErrors.includes(err.code)) {
                 console.error(`   ❌ WebSocket proxy error:`, err.message);
+                console.error(`   Stack:`, err.stack);
               }
               if (!socket.destroyed) {
-                socket.destroy();
+                try {
+                  socket.destroy();
+                } catch (e) {}
               }
             }
             return; // Stop event propagation - don't let middleware handle this
