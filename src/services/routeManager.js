@@ -112,7 +112,9 @@ function registerNeocoreRoutes(app, allSites, server) {
       const socketProxy = createProxyMiddleware({
         target: wsTarget,
         changeOrigin: true,
-        ws: true,
+        // IMPORTANT: we handle ALL Socket.IO WebSocket upgrades ourselves via server.on('upgrade')
+        // Keep this middleware HTTP-only (polling) to avoid double-upgrade handling and "Invalid frame header"
+        ws: false,
         xfwd: true,
         secure: false,
         timeout: 0, // No timeout
@@ -182,9 +184,10 @@ function registerNeocoreRoutes(app, allSites, server) {
   app.use('/socket.io', (req, res, next) => {
     const site = detectSite(req, allSites);
     if (site?.neocore?.enabled) {
-      // Rewrite to site-prefixed path and use the site's proxy
-      const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
-      req.url = `/vpn/${site.name}/neocore/socket.io${queryString}`;
+      // NOTE: when mounted at '/socket.io', Express strips that prefix.
+      // If the browser hits '/socket.io/?EIO=4...', then req.url here is '/?EIO=4...'
+      // We must preserve the full path+query (including leading '/').
+      req.url = `/vpn/${site.name}/neocore/socket.io${req.url}`;
       console.log(`🔄 Root socket.io rewrite: ${req.url} → ${site.name}`);
       const proxy = socketProxies.get(site.name);
       if (proxy) {
@@ -194,8 +197,7 @@ function registerNeocoreRoutes(app, allSites, server) {
     // Fallback to first site (not ideal, but better than failing)
     const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
     if (firstSite) {
-      const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
-      req.url = `/vpn/${firstSite.name}/neocore/socket.io${queryString}`;
+      req.url = `/vpn/${firstSite.name}/neocore/socket.io${req.url}`;
       console.log(`🔄 Root socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
       const proxy = socketProxies.get(firstSite.name);
       if (proxy) {
@@ -343,170 +345,60 @@ function registerNeocoreRoutes(app, allSites, server) {
     });
     
     // Handle WebSocket upgrades for root-level /socket.io requests
-    // Express middleware will handle /vpn/{site}/neocore/socket.io naturally
+    // We handle ALL socket.io websocket upgrades here (both root + site-prefixed),
+    // to guarantee single handling and avoid frame corruption.
     server.on('upgrade', (req, socket, head) => {
-      let url = req.url || '';
-      
-      // Only handle socket.io URLs without site prefix
-      if (url.startsWith('/socket.io') && !url.startsWith('/vpn/')) {
-        const cookieHeader = req.headers.cookie || '';
-        const referer = req.headers.referer || '';
-        
-        console.log(`🔌 WebSocket upgrade: ${url}`);
-        console.log(`   Cookie: ${cookieHeader}`);
-        
-        let targetSite = null;
-        
-        // Priority 1: Cookie (most reliable for WebSocket - set when page loads)
-        if (cookieHeader) {
-          const cookieMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
-          if (cookieMatch) {
-            const siteName = cookieMatch[1].trim();
-            targetSite = allSites[siteName];
-            if (targetSite?.neocore?.enabled) {
-              console.log(`   🍪 Detected site from cookie: ${targetSite.name}`);
-            }
-          }
-        }
-        
-        // Priority 2: Try detectSite function (checks URL, referer, origin, cookie)
-        if (!targetSite?.neocore?.enabled) {
-          targetSite = detectSite(req, allSites);
-          if (targetSite?.neocore?.enabled) {
-            console.log(`   🔍 Detected site from detectSite: ${targetSite.name}`);
-          }
-        }
-        
-        // Priority 3: Try referer directly (fallback)
-        if (!targetSite?.neocore?.enabled && referer) {
-          const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
-          if (refererMatch) {
-            targetSite = allSites[refererMatch[1]];
-            if (targetSite?.neocore?.enabled) {
-              console.log(`   📄 Detected site from referer: ${targetSite.name}`);
-            }
-          }
-        }
-        
-        // Priority 4: Last resort - fallback to first enabled site
-        if (!targetSite?.neocore?.enabled) {
-          targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
-          if (targetSite) {
-            console.log(`   ⚠️  Using fallback: ${targetSite.name}`);
-          }
-        }
-        
-        if (targetSite?.neocore?.enabled) {
-          // Use wsTarget for direct backend connection
-          const wsTarget = targetSite.neocore.wsTarget || targetSite.neocore.target;
-          const targetUrl = new URL(wsTarget);
-          
-          console.log(`   ✅ Proxying WebSocket to ${targetSite.name}`);
-          console.log(`   Target: ${wsTarget}${req.url}`);
-          
-          // Create http-proxy instance for this upgrade
-          const proxy = httpProxy.createProxyServer({
-            target: wsTarget,
-            ws: true,
-            changeOrigin: true,
-            secure: false,
-            timeout: 0,
-            proxyTimeout: 0,
-            xfwd: true
-          });
-          
-          // CRITICAL: Set headers in proxyReqWs handler (before upgrade request is sent)
-          proxy.on('proxyReqWs', (proxyReq, req, socket) => {
-            // Host header: Include port if not standard (80/443)
-            const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
-            const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
-            
-            // Set headers on the actual proxy request (not req.headers)
-            proxyReq.setHeader('Host', hostHeader); // CRITICAL: Socket.IO needs correct Host header
-            proxyReq.setHeader('X-Forwarded-Proto', targetUrl.protocol === 'https:' ? 'wss' : 'ws');
-            proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || req.headers['x-forwarded-for'] || '');
-            proxyReq.setHeader('X-Real-IP', req.socket.remoteAddress || '');
-            
-            // Preserve original headers that Socket.IO might need
-            if (req.headers.origin) {
-              proxyReq.setHeader('Origin', req.headers.origin);
-            }
-            if (req.headers.cookie) {
-              proxyReq.setHeader('Cookie', req.headers.cookie);
-            }
-            
-            // Set Connection and Upgrade headers explicitly for WebSocket
-            proxyReq.setHeader('Connection', 'Upgrade');
-            proxyReq.setHeader('Upgrade', 'websocket');
-            
-            console.log(`   🔗 Connecting to backend: ${wsTarget}${req.url}`);
-            console.log(`   Host header: ${hostHeader} (port: ${port})`);
-          });
-          
-          // Handle upgrade response from backend
-          proxy.on('upgrade', (res, socket, head) => {
-            console.log(`   ⬆️  WebSocket upgrade response received (${targetSite.name})`);
-            console.log(`   Status: ${res.statusCode}`);
-            if (res.statusCode !== 101) {
-              console.error(`   ⚠️  Unexpected status code: ${res.statusCode} (expected 101)`);
-            } else {
-              console.log(`   ✅ Upgrade successful - WebSocket protocol established`);
-            }
-          });
-          
-          // Ensure socket is in flowing mode
-          socket.resume();
-          
-          // Handle proxy errors
-          proxy.on('error', (err, req, socket) => {
-            const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
-            if (!suppressErrors.includes(err.code)) {
-              console.error(`   ❌ WebSocket proxy error (${targetSite.name}):`, err.message);
-              console.error(`   Code: ${err.code}`);
-            }
-            if (socket && !socket.destroyed) {
-              try {
-                socket.destroy();
-              } catch (e) {}
-            }
-          });
-          
-          // Handle successful backend connection
-          proxy.on('open', (proxySocket) => {
-            console.log(`   ✅ WebSocket connection established to backend (${targetSite.name})`);
-            console.log(`   📡 Real-time data should now flow`);
-            // Ensure proxy socket is in flowing mode
-            proxySocket.resume();
-          });
-          
-          proxy.on('close', () => {
-            console.log(`   🔌 WebSocket connection closed (${targetSite.name})`);
-          });
-          
-          // Proxy the upgrade
-          try {
-            proxy.ws(req, socket, head);
-            console.log(`   🔗 WebSocket upgrade initiated`);
-          } catch (err) {
-            console.error(`   ❌ Failed to proxy WebSocket:`, err.message);
-            console.error(`   Stack:`, err.stack);
-            if (!socket.destroyed) {
-              socket.destroy();
-            }
-          }
-          
-          return; // Stop event propagation
-        } else {
-          console.error(`   ❌ No site detected, closing connection`);
-          console.error(`   Available sites: ${Object.keys(allSites).join(', ')}`);
-          socket.destroy();
-          return;
-        }
+      const url = req.url || '';
+      if (!url.includes('/socket.io')) return;
+
+      // Determine site
+      let targetSite = null;
+
+      // 1) If site is already in URL (prefixed)
+      const urlMatch = url.match(/^\/vpn\/([^\/]+)\/neocore\/socket\.io(\/|\?|$)/);
+      if (urlMatch) {
+        targetSite = allSites[urlMatch[1]];
       }
-      // For URLs with site prefix, let middleware handle it naturally
+
+      // 2) Cookie / referer / origin
+      if (!targetSite?.neocore?.enabled) {
+        const cookieHeader = req.headers.cookie || '';
+        const cookieMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
+        if (cookieMatch) targetSite = allSites[cookieMatch[1].trim()];
+      }
+      if (!targetSite?.neocore?.enabled) targetSite = detectSite(req, allSites);
+      if (!targetSite?.neocore?.enabled) targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
+
+      console.log(`🔌 WebSocket upgrade: ${url}`);
+      console.log(`   Site: ${targetSite?.name || 'NONE'}`);
+
+      if (!targetSite?.neocore?.enabled) {
+        console.error(`   ❌ No site detected, closing connection`);
+        socket.destroy();
+        return;
+      }
+
+      // Ensure backend sees a pure Socket.IO path: /socket.io/...
+      if (url.startsWith(`/vpn/${targetSite.name}/neocore`)) {
+        req.url = url.replace(new RegExp(`^/vpn/${targetSite.name}/neocore`), '');
+      }
+
+      const proxy = wsProxies.get(targetSite.name);
+      if (!proxy) {
+        console.error(`   ❌ wsProxy not found for site: ${targetSite.name}`);
+        socket.destroy();
+        return;
+      }
+
+      try {
+        proxy.ws(req, socket, head);
+      } catch (err) {
+        console.error(`   ❌ wsProxy.ws failed (${targetSite.name}): ${err.message}`);
+        if (!socket.destroyed) socket.destroy();
+      }
     });
     
-    console.log(`✅ WebSocket URL rewrite handler registered (Express middleware will handle upgrades)`);
+    console.log(`✅ WebSocket upgrade handler registered (single handler; per-site proxies reused)`);
   }
 
   // HTML route
