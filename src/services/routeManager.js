@@ -46,6 +46,28 @@ function detectSite(req, allSites) {
 }
 
 /**
+ * Detect device from referer header
+ * Returns: { site, deviceId } or null
+ */
+function detectDeviceFromReferer(referer, allSites) {
+  if (!referer) return null;
+  
+  // Match pattern: /vpn/{site}/devices/{deviceId}
+  const deviceMatch = referer.match(/\/vpn\/([^\/]+)\/devices\/([^\/\?]+)/);
+  if (deviceMatch) {
+    const siteName = deviceMatch[1];
+    const deviceId = deviceMatch[2];
+    const site = allSites[siteName];
+    
+    if (site?.devices?.enabled && site.devices.deviceList?.[deviceId]) {
+      return { site, deviceId };
+    }
+  }
+  
+  return null;
+}
+
+/**
  * Create proxy middleware with common configuration
  */
 function createProxy(target, pathRewrite, siteName) {
@@ -492,6 +514,36 @@ function registerNeocoreRoutes(app, allSites, server) {
  * Devices routes MUST be registered BEFORE neocore routes to avoid conflicts
  */
 function registerDevicesRoutes(app, allSites) {
+  // CRITICAL: Universal middleware for ALL device assets
+  // Catches root-level requests and rewrites them to device-specific paths
+  // This handles ANY asset file from ANY device (JS, CSS, images, etc.)
+  app.use((req, res, next) => {
+    const url = req.url || '';
+    
+    // Skip routes that shouldn't be rewritten
+    if (url.startsWith('/vpn/') || 
+        url.startsWith('/api') || 
+        url.startsWith('/socket.io') || 
+        url.startsWith('/health') ||
+        url.startsWith('/static/') ||
+        url.match(/^\/main\.[^\/]+\.(js|css)$/)) {
+      return next();
+    }
+    
+    // Detect device from referer
+    const referer = req.headers.referer || '';
+    const deviceInfo = detectDeviceFromReferer(referer, allSites);
+    
+    if (deviceInfo) {
+      const { site, deviceId } = deviceInfo;
+      const originalUrl = req.url;
+      req.url = `/vpn/${site.name}/devices/${deviceId}${url}`;
+      console.log(`🔄 Device asset: ${originalUrl} → ${req.url} (${site.name}/${deviceId})`);
+    }
+    
+    next();
+  });
+
   // Register individual device routes for each site
   Object.values(allSites).forEach(site => {
     if (site.devices?.enabled && site.devices.deviceList) {
@@ -510,6 +562,8 @@ function registerDevicesRoutes(app, allSites) {
       console.warn(`⚠️  Site ${site.name} has devices enabled but no deviceList configured`);
     }
   });
+  
+  console.log(`✅ Universal device asset handler active - handles ANY device from ANY site`);
 }
 
 /**
