@@ -105,15 +105,37 @@ function registerNeocoreRoutes(app, allSites, server) {
   
   Object.values(allSites).forEach(site => {
     if (site.neocore?.enabled) {
-      // Socket.io proxy - site-specific
-      const socketProxy = createProxy(
-        site.neocore.target,
-        { [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io' },
-        site.name
-      );
+      // Use wsTarget for WebSocket if available, otherwise use target
+      const wsTarget = site.neocore.wsTarget || site.neocore.target;
+      
+      // Socket.io proxy - site-specific (use wsTarget for WebSocket)
+      const socketProxy = createProxyMiddleware({
+        target: wsTarget,
+        changeOrigin: true,
+        ws: true,
+        xfwd: true,
+        secure: false,
+        timeout: 0, // No timeout
+        proxyTimeout: 0, // No proxy timeout
+        pathRewrite: { [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io' },
+        logLevel: 'warn',
+        wsErrorHandler: (err, req, socket) => {
+          const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+          if (!suppressErrors.includes(err.code)) {
+            console.error(`⚠️  WebSocket error (${site.name}):`, err.message);
+          }
+        },
+        onError: (err, req, res) => {
+          if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && !res.headersSent && !res.writableEnded) {
+            try {
+              res.status(502).json({ error: "Proxy error", message: err.message });
+            } catch (e) {}
+          }
+        }
+      });
       socketProxies.set(site.name, socketProxy);
       
-      // API proxy - site-specific
+      // API proxy - site-specific (use regular target)
       const apiProxy = createProxy(
         site.neocore.target,
         { [`^/vpn/${site.name}/neocore/api`]: '/api' },
@@ -122,7 +144,7 @@ function registerNeocoreRoutes(app, allSites, server) {
       apiProxies.set(site.name, apiProxy);
       
       console.log(`✅ Registered proxies for ${site.name}:`);
-      console.log(`   🔌 /vpn/${site.name}/neocore/socket.io → ${site.neocore.target}/socket.io`);
+      console.log(`   🔌 /vpn/${site.name}/neocore/socket.io → ${wsTarget}/socket.io`);
       console.log(`   🌐 /vpn/${site.name}/neocore/api → ${site.neocore.target}/api`);
     }
   });
@@ -298,6 +320,12 @@ function registerNeocoreRoutes(app, allSites, server) {
           console.log(`   Status: ${res.statusCode}`);
           if (res.statusCode !== 101) {
             console.error(`   ⚠️  Unexpected status code: ${res.statusCode} (expected 101)`);
+          } else {
+            console.log(`   ✅ Upgrade successful - WebSocket protocol established`);
+            // Ensure upgrade response headers are properly set
+            if (res.headers) {
+              console.log(`   📋 Upgrade headers: Connection=${res.headers.connection}, Upgrade=${res.headers.upgrade}`);
+            }
           }
         });
         
@@ -377,82 +405,19 @@ function registerNeocoreRoutes(app, allSites, server) {
         }
         
         if (targetSite?.neocore?.enabled) {
-          const proxy = wsProxies.get(targetSite.name);
-          if (proxy) {
-            handledUpgrades.add(req);
-            
-            // Ensure URL is correct (should be /socket.io/...)
-            // Don't modify req.url - keep it as /socket.io/... for backend
-            const originalUrl = req.url;
-            
-            const wsTarget = targetSite.neocore.wsTarget || targetSite.neocore.target;
-            console.log(`   ✅ Proxying WebSocket to ${targetSite.name}`);
-            console.log(`   Target: ${wsTarget}${originalUrl}`);
-            
-            // Manually proxy the upgrade - this prevents middleware from also handling it
-            try {
-              // Ensure proper headers are set on the request
-              const wsTarget = targetSite.neocore.wsTarget || targetSite.neocore.target;
-              const targetUrl = new URL(wsTarget);
-              // Host header: Include port if not standard (80/443)
-              const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
-              const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
-              
-              req.headers['host'] = hostHeader; // Critical for Socket.IO
-              req.headers['x-forwarded-proto'] = targetUrl.protocol === 'https:' ? 'wss' : 'ws';
-              req.headers['x-forwarded-for'] = req.socket.remoteAddress || req.headers['x-forwarded-for'] || '';
-              req.headers['x-real-ip'] = req.socket.remoteAddress || '';
-              
-              // Ensure Connection and Upgrade headers are set
-              if (!req.headers['connection']) {
-                req.headers['connection'] = 'Upgrade';
-              }
-              if (!req.headers['upgrade']) {
-                req.headers['upgrade'] = 'websocket';
-              }
-              
-              // Track socket for debugging - DO NOT add 'data' handlers
-              // Adding data handlers interferes with http-proxy's WebSocket frame forwarding
-              socket.on('error', (err) => {
-                const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
-                if (!suppressErrors.includes(err.code)) {
-                  console.error(`   ❌ Client socket error (${targetSite.name}):`, err.message);
-                  console.error(`   Error code: ${err.code}`);
-                }
-              });
-              
-              socket.on('close', (hadError) => {
-                if (hadError) {
-                  console.log(`   🔌 Client socket closed with error (${targetSite.name})`);
-                } else {
-                  console.log(`   🔌 Client socket closed normally (${targetSite.name})`);
-                }
-              });
-              
-              // Ensure client socket is in flowing mode
-              socket.resume();
-              
-              // Call proxy.ws() - target is already set in proxy configuration
-              // Let http-proxy handle all WebSocket frame forwarding automatically
-              proxy.ws(req, socket, head);
-              
-              console.log(`   🔗 WebSocket upgrade initiated - waiting for backend connection...`);
-            } catch (err) {
-              console.error(`   ❌ Failed to initiate WebSocket proxy:`, err.message);
-              console.error(`   Error code: ${err.code}`);
-              console.error(`   Stack:`, err.stack);
-              if (!socket.destroyed) {
-                try {
-                  socket.destroy();
-                } catch (e) {}
-              }
-            }
-            return; // Stop event propagation - don't let middleware handle this
-          } else {
-            console.error(`   ❌ Proxy not found for site: ${targetSite.name}`);
-            socket.destroy();
-            return;
-          }
+          // Rewrite URL to include site prefix so middleware can handle it
+          const originalUrl = req.url;
+          req.url = `/vpn/${targetSite.name}/neocore${originalUrl}`;
+          
+          console.log(`   ✅ Rewriting WebSocket URL: ${originalUrl} → ${req.url}`);
+          console.log(`   🎯 Site: ${targetSite.name}`);
+          
+          // Let the middleware handle the upgrade - don't manually proxy
+          // The socketProxy middleware will handle the upgrade properly
+          // Just mark as handled to prevent double handling
+          handledUpgrades.add(req);
+          
+          // Don't return - let the request continue to middleware
         } else {
           console.error(`   ❌ No site detected, closing connection`);
           console.error(`   Available sites: ${Object.keys(allSites).join(', ')}`);
