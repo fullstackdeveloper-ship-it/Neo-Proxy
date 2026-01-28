@@ -223,10 +223,13 @@ function registerNeocoreRoutes(app, allSites, server) {
         proxy.on('proxyReqWs', (proxyReq, req, socket) => {
           // Set proper headers for WebSocket (critical for Socket.IO)
           const targetUrl = new URL(site.neocore.target);
-          // Host header should be hostname:port (e.g., "10.9.0.5:80")
-          const hostHeader = targetUrl.port ? `${targetUrl.hostname}:${targetUrl.port}` : targetUrl.hostname;
+          // Host header: For nginx on port 80, use hostname only (nginx handles port internally)
+          // But if port is explicitly specified and not 80, include it
+          const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
+          const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
+          
           proxyReq.setHeader('Host', hostHeader); // Critical: Socket.IO needs correct Host header
-          proxyReq.setHeader('X-Forwarded-Proto', 'ws');
+          proxyReq.setHeader('X-Forwarded-Proto', targetUrl.protocol === 'https:' ? 'wss' : 'ws');
           proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || req.headers['x-forwarded-for'] || '');
           proxyReq.setHeader('X-Real-IP', req.socket.remoteAddress || '');
           
@@ -238,8 +241,12 @@ function registerNeocoreRoutes(app, allSites, server) {
             proxyReq.setHeader('Cookie', req.headers.cookie);
           }
           
+          // Set Connection and Upgrade headers explicitly for WebSocket
+          proxyReq.setHeader('Connection', 'Upgrade');
+          proxyReq.setHeader('Upgrade', 'websocket');
+          
           console.log(`   🔗 Connecting to backend: ${site.neocore.target}${req.url}`);
-          console.log(`   Host header: ${hostHeader}`);
+          console.log(`   Host header: ${hostHeader} (port: ${port})`);
         });
         
         // Handle WebSocket upgrade success (connection to backend established)
@@ -340,12 +347,22 @@ function registerNeocoreRoutes(app, allSites, server) {
             try {
               // Ensure proper headers are set on the request
               const targetUrl = new URL(targetSite.neocore.target);
-              // Host header should be hostname:port
-              const hostHeader = targetUrl.port ? `${targetUrl.hostname}:${targetUrl.port}` : targetUrl.hostname;
+              // Host header: For nginx on port 80, use hostname only
+              const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
+              const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
+              
               req.headers['host'] = hostHeader; // Critical for Socket.IO
-              req.headers['x-forwarded-proto'] = 'ws';
+              req.headers['x-forwarded-proto'] = targetUrl.protocol === 'https:' ? 'wss' : 'ws';
               req.headers['x-forwarded-for'] = req.socket.remoteAddress || req.headers['x-forwarded-for'] || '';
               req.headers['x-real-ip'] = req.socket.remoteAddress || '';
+              
+              // Ensure Connection and Upgrade headers are set
+              if (!req.headers['connection']) {
+                req.headers['connection'] = 'Upgrade';
+              }
+              if (!req.headers['upgrade']) {
+                req.headers['upgrade'] = 'websocket';
+              }
               
               // Track socket for debugging
               socket.on('error', (err) => {
