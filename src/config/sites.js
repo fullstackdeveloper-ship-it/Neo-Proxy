@@ -18,10 +18,10 @@
 const SITES = {
   site1: {
     name: "site1",
-    vpnIp: "10.9.0.7",           // VPN transport IP (from 10.9.0.0/24)
+    vpnIp: "10.9.0.5",           // VPN transport IP (from 10.9.0.0/24)
     neocore: {
       enabled: true,
-      target: "http://10.9.0.7:5173",  // NeoCore services on VPN IP port 80
+      target: "http://10.9.0.5:80",  // NeoCore services on VPN IP port 80
       // Routes: /vpn/site1/neocore/*
     },
     devices: {
