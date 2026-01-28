@@ -21,7 +21,8 @@ const SITES = {
     vpnIp: "10.9.0.5",           // VPN transport IP (from 10.9.0.0/24)
     neocore: {
       enabled: true,
-      target: "http://10.9.0.5:80",  // NeoCore services on VPN IP port 80
+      target: "http://10.9.0.5:80",  // NeoCore services on VPN IP port 80 (nginx)
+      wsTarget: "http://10.9.0.5:5001",  // Direct WebSocket connection to backend (bypass nginx)
       // Routes: /vpn/site1/neocore/*
     },
     devices: {
@@ -54,6 +55,7 @@ const SITES = {
     neocore: {
       enabled: true,
       target: "http://10.9.0.2:80",
+      wsTarget: "http://10.9.0.2:5001",  // Direct WebSocket connection to backend
       // Routes: /vpn/site2/neocore/*
     },
     devices: {

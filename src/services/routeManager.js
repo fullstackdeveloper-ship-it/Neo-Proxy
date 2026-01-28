@@ -190,8 +190,10 @@ function registerNeocoreRoutes(app, allSites, server) {
     const wsProxies = new Map();
     Object.values(allSites).forEach(site => {
       if (site.neocore?.enabled) {
+        // Use wsTarget if available (direct backend connection), otherwise use target (nginx)
+        const wsTarget = site.neocore.wsTarget || site.neocore.target;
         const proxy = httpProxy.createProxyServer({
-          target: site.neocore.target,
+          target: wsTarget,
           ws: true,
           changeOrigin: true,
           secure: false,
@@ -199,6 +201,8 @@ function registerNeocoreRoutes(app, allSites, server) {
           xfwd: true, // Forward X-Forwarded-* headers
           // Don't rewrite path - keep /socket.io as is
         });
+        
+        console.log(`   🔌 WebSocket proxy target for ${site.name}: ${wsTarget}`);
         
         // Handle proxy errors (including backend connection failures)
         proxy.on('error', (err, req, socket) => {
@@ -253,6 +257,18 @@ function registerNeocoreRoutes(app, allSites, server) {
         proxy.on('open', (proxySocket) => {
           console.log(`   ✅ WebSocket connection established to backend (${site.name})`);
           console.log(`   📡 Real-time data should now flow`);
+          
+          // Ensure proxy socket stays alive and forwards data
+          proxySocket.on('error', (err) => {
+            const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
+            if (!suppressErrors.includes(err.code)) {
+              console.error(`   ❌ Proxy socket error (${site.name}):`, err.message);
+            }
+          });
+          
+          proxySocket.on('close', () => {
+            console.log(`   🔌 Proxy socket closed (${site.name})`);
+          });
         });
         
         // Handle WebSocket close
@@ -263,6 +279,12 @@ function registerNeocoreRoutes(app, allSites, server) {
         // Handle WebSocket proxy response (backend responded)
         proxy.on('proxyRes', (proxyRes, req, res) => {
           console.log(`   📥 Backend response: ${proxyRes.statusCode} (${site.name})`);
+        });
+        
+        // Handle WebSocket upgrade response
+        proxy.on('upgrade', (res, socket, head) => {
+          console.log(`   ⬆️  WebSocket upgrade response received (${site.name})`);
+          console.log(`   Status: ${res.statusCode}`);
         });
         
         wsProxies.set(site.name, proxy);
@@ -340,14 +362,16 @@ function registerNeocoreRoutes(app, allSites, server) {
             // Don't modify req.url - keep it as /socket.io/... for backend
             const originalUrl = req.url;
             
+            const wsTarget = targetSite.neocore.wsTarget || targetSite.neocore.target;
             console.log(`   ✅ Proxying WebSocket to ${targetSite.name}`);
-            console.log(`   Target: ${targetSite.neocore.target}${originalUrl}`);
+            console.log(`   Target: ${wsTarget}${originalUrl}`);
             
             // Manually proxy the upgrade - this prevents middleware from also handling it
             try {
               // Ensure proper headers are set on the request
-              const targetUrl = new URL(targetSite.neocore.target);
-              // Host header: For nginx on port 80, use hostname only
+              const wsTarget = targetSite.neocore.wsTarget || targetSite.neocore.target;
+              const targetUrl = new URL(wsTarget);
+              // Host header: Include port if not standard (80/443)
               const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
               const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
               
