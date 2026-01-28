@@ -7,13 +7,74 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 const httpProxy = require("http-proxy");
 const { createDeviceProxy } = require("./proxyFactory");
 const { serveAsset, serveHTML } = require("./assetsService");
+const { getSiteBySlug } = require("./siteCacheService");
 const fs = require('fs');
 const path = require('path');
 
 /**
  * Detect site from URL, referer header, or cookies
+ * Now supports runtime database lookup with caching
  */
-function detectSite(req, allSites) {
+async function detectSite(req, allSites) {
+  let siteSlug = null;
+  
+  // Try URL path first (most reliable)
+  const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
+  if (urlMatch) {
+    siteSlug = urlMatch[1];
+  } else {
+    // Try referer header (full URL with path) - works for HTTP requests
+    const referer = req.headers.referer || '';
+    const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
+    if (refererMatch) {
+      siteSlug = refererMatch[1];
+    } else {
+      // Try origin header (might have path in some cases)
+      const origin = req.headers.origin || '';
+      const originMatch = origin.match(/\/vpn\/([^\/]+)\//);
+      if (originMatch) {
+        siteSlug = originMatch[1];
+      } else {
+        // Try cookie (if session-based approach was used)
+        if (req.headers.cookie) {
+          const cookieMatch = req.headers.cookie.match(/vpn-site=([^;]+)/);
+          if (cookieMatch) {
+            siteSlug = cookieMatch[1];
+          }
+        }
+      }
+    }
+  }
+  
+  if (!siteSlug) {
+    return null;
+  }
+  
+  // First check static sites
+  if (allSites[siteSlug]) {
+    return allSites[siteSlug];
+  }
+  
+  // Not in static config - try cache/database lookup
+  try {
+    const siteConfig = await getSiteBySlug(siteSlug);
+    if (siteConfig) {
+      // Add to allSites for this request (but don't modify the original object)
+      // Return the cached/looked-up site
+      return siteConfig;
+    }
+  } catch (error) {
+    console.error(`❌ Error looking up site ${siteSlug}:`, error.message);
+  }
+  
+  return null;
+}
+
+/**
+ * Synchronous version of detectSite (for use in synchronous contexts)
+ * Only checks static sites, not database
+ */
+function detectSiteSync(req, allSites) {
   // Try URL path first (most reliable)
   const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
   if (urlMatch) {
@@ -49,7 +110,43 @@ function detectSite(req, allSites) {
  * Detect device from referer header
  * Returns: { site, deviceId } or null
  */
-function detectDeviceFromReferer(referer, allSites) {
+/**
+ * Detect device from referer header
+ * Returns: { site, deviceId } or null
+ * Now supports runtime database lookup with caching
+ */
+async function detectDeviceFromReferer(referer, allSites) {
+  if (!referer) return null;
+  
+  // Match pattern: /vpn/{site}/devices/{deviceId}
+  const deviceMatch = referer.match(/\/vpn\/([^\/]+)\/devices\/([^\/\?]+)/);
+  if (deviceMatch) {
+    const siteSlug = deviceMatch[1];
+    const deviceId = deviceMatch[2];
+    let site = allSites[siteSlug];
+    
+    // If not in static config, try database lookup
+    if (!site?.devices?.deviceList?.[deviceId]) {
+      try {
+        site = await getSiteBySlug(siteSlug);
+      } catch (error) {
+        console.error(`❌ Error looking up site ${siteSlug} for device ${deviceId}:`, error.message);
+      }
+    }
+    
+    if (site?.devices?.enabled && site.devices.deviceList?.[deviceId]) {
+      return { site, deviceId };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Synchronous version of detectDeviceFromReferer (for use in synchronous contexts)
+ * Only checks static sites, not database
+ */
+function detectDeviceFromRefererSync(referer, allSites) {
   if (!referer) return null;
   
   // Match pattern: /vpn/{site}/devices/{deviceId}
@@ -123,7 +220,17 @@ function serveStaticFile(filePath, res, contentType) {
 /**
  * Register Neocore routes (HTML, assets, API, Socket.io)
  */
-function registerNeocoreRoutes(app, allSites, server) {
+function registerNeocoreRoutes(app, sitesOrGetter, server) {
+  // Helper function to get current sites (supports both object and getter function)
+  const getCurrentSites = () => {
+    if (typeof sitesOrGetter === 'function') {
+      return sitesOrGetter();
+    }
+    return sitesOrGetter;
+  };
+  
+  const allSites = getCurrentSites();
+  
   // Create socket.io proxies for each site FIRST (before other routes)
   const socketProxies = new Map();
   const apiProxies = new Map();
@@ -176,22 +283,40 @@ function registerNeocoreRoutes(app, allSites, server) {
     }
   });
 
-  // URL rewrite interceptors (for HTTP requests - socket.io polling, API calls)
-  app.use((req, res, next) => {
-    // Only intercept API requests without site prefix
-    // IMPORTANT: Do NOT rewrite /socket.io here. Express mounts strip prefixes (e.g. '/socket.io' -> '/'),
-    // and doing it in two places causes subtle path/query bugs that break Engine.IO.
-    if (req.url.startsWith('/api') && !req.url.startsWith('/vpn/')) {
-      const site = detectSite(req, allSites);
-      if (site?.neocore?.enabled) {
-        const prefix = `/vpn/${site.name}/neocore`;
-        req.url = `${prefix}${req.url}`;
-        console.log(`🔄 API rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
-      } else {
-        console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
-      }
+  // Root-level API route handler (for /api/* requests without site prefix)
+  // Rewrites to /vpn/{site}/neocore/api/* and proxies to backend
+  app.use('/api', async (req, res, next) => {
+    // Skip if already has site prefix
+    if (req.url.startsWith('/vpn/')) {
+      return next();
     }
-    next();
+
+    const currentSites = getCurrentSites();
+    const site = await detectSite(req, currentSites);
+    
+    if (site?.neocore?.enabled) {
+      // Get or create API proxy for this site
+      let apiProxy = apiProxies.get(site.name);
+      if (!apiProxy) {
+        // Create proxy dynamically for DB-loaded sites
+        console.log(`🔧 Creating dynamic API proxy for site: ${site.name}`);
+        apiProxy = createProxy(
+          site.neocore.target,
+          { [`^/vpn/${site.name}/neocore/api`]: '/api' },
+          site.name
+        );
+        apiProxies.set(site.name, apiProxy);
+      }
+      
+      console.log(`🔄 Root API rewrite: ${req.url} → ${site.name}/neocore/api${req.url} (from ${req.headers.referer || 'direct'})`);
+      // Rewrite URL to include site prefix (proxy will strip /vpn/{site}/neocore/api)
+      const originalUrl = req.url;
+      req.url = `/vpn/${site.name}/neocore/api${originalUrl}`;
+      return apiProxy(req, res, next);
+    } else {
+      console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
+      res.status(404).json({ error: 'API endpoint not found - no site detected' });
+    }
   });
 
   // Register site-specific socket.io routes (MUST be before root-level route)
@@ -204,7 +329,8 @@ function registerNeocoreRoutes(app, allSites, server) {
 
   // Root-level socket.io route (fallback - handles /socket.io/ requests)
   app.use('/socket.io', (req, res, next) => {
-    const site = detectSite(req, allSites);
+    const currentSites = getCurrentSites();
+    const site = detectSite(req, currentSites);
     if (site?.neocore?.enabled) {
       // NOTE: when mounted at '/socket.io', Express strips that prefix.
       // If the browser hits '/socket.io/?EIO=4...', then req.url here is '/?EIO=4...'
@@ -217,7 +343,7 @@ function registerNeocoreRoutes(app, allSites, server) {
       }
     }
     // Fallback to first site (not ideal, but better than failing)
-    const firstSite = Object.values(allSites).find(s => s.neocore?.enabled);
+    const firstSite = Object.values(currentSites).find(s => s.neocore?.enabled);
     if (firstSite) {
       req.url = `/vpn/${firstSite.name}/neocore/socket.io${req.url}`;
       console.log(`🔄 Root socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
@@ -372,6 +498,9 @@ function registerNeocoreRoutes(app, allSites, server) {
     server.on('upgrade', (req, socket, head) => {
       const url = req.url || '';
       if (!url.includes('/socket.io')) return;
+      
+      // Get current sites dynamically
+      const currentSites = getCurrentSites();
 
       // Determine site
       let targetSite = null;
@@ -379,17 +508,18 @@ function registerNeocoreRoutes(app, allSites, server) {
       // 1) If site is already in URL (prefixed)
       const urlMatch = url.match(/^\/vpn\/([^\/]+)\/neocore\/socket\.io(\/|\?|$)/);
       if (urlMatch) {
-        targetSite = allSites[urlMatch[1]];
+        targetSite = currentSites[urlMatch[1]];
       }
 
       // 2) Cookie / referer / origin
       if (!targetSite?.neocore?.enabled) {
         const cookieHeader = req.headers.cookie || '';
         const cookieMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
-        if (cookieMatch) targetSite = allSites[cookieMatch[1].trim()];
+        if (cookieMatch) targetSite = currentSites[cookieMatch[1].trim()];
       }
-      if (!targetSite?.neocore?.enabled) targetSite = detectSite(req, allSites);
-      if (!targetSite?.neocore?.enabled) targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
+      // Use sync version for WebSocket (async not supported in upgrade handler)
+      if (!targetSite?.neocore?.enabled) targetSite = detectSiteSync(req, currentSites);
+      if (!targetSite?.neocore?.enabled) targetSite = Object.values(currentSites).find(s => s.neocore?.enabled);
 
       console.log(`🔌 WebSocket upgrade: ${url}`);
       console.log(`   Site: ${targetSite?.name || 'NONE'}`);
@@ -423,9 +553,26 @@ function registerNeocoreRoutes(app, allSites, server) {
     console.log(`✅ WebSocket upgrade handler registered (single handler; per-site proxies reused)`);
   }
 
-  // HTML route
-  app.get('/vpn/:siteName/neocore', (req, res) => {
-    const site = allSites[req.params.siteName];
+  // HTML route - with runtime database lookup
+  app.get('/vpn/:siteName/neocore', async (req, res) => {
+    const currentSites = getCurrentSites();
+    let site = currentSites[req.params.siteName];
+    
+    // If not in static config, try database lookup
+    if (!site?.neocore?.enabled) {
+      console.log(`🔍 Site ${req.params.siteName} not in static config, checking database...`);
+      try {
+        site = await getSiteBySlug(req.params.siteName);
+        if (site) {
+          // Add to current sites temporarily for this request
+          // Note: This doesn't modify the original SITES object
+          console.log(`✅ Found site ${req.params.siteName} in database: VPN IP ${site.vpnIp}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
+      }
+    }
+    
     if (!site?.neocore?.enabled) {
       return res.status(404).json({ error: 'Site not found' });
     }
@@ -446,7 +593,8 @@ function registerNeocoreRoutes(app, allSites, server) {
   app.get(/^\/([^\/]+\.(png|jpg|jpeg|svg|ico|gif|webp))$/, (req, res) => {
     // Extract filename from URL path (remove leading slash)
     const fileName = req.path.substring(1);
-    const site = detectSite(req, allSites) || Object.values(allSites).find(s => s.neocore?.enabled);
+    const currentSites = getCurrentSites();
+    const site = detectSite(req, currentSites) || Object.values(currentSites).find(s => s.neocore?.enabled);
     
     if (!site) {
       return res.status(404).json({ error: 'Site not found' });
@@ -467,9 +615,20 @@ function registerNeocoreRoutes(app, allSites, server) {
     }
   });
 
-  // Site-prefixed static assets
-  app.get('/vpn/:siteName/neocore/static/:type/:fileName', (req, res) => {
-    const site = allSites[req.params.siteName];
+  // Site-prefixed static assets - with runtime database lookup
+  app.get('/vpn/:siteName/neocore/static/:type/:fileName', async (req, res) => {
+    const currentSites = getCurrentSites();
+    let site = currentSites[req.params.siteName];
+    
+    // If not in static config, try database lookup
+    if (!site?.neocore?.enabled) {
+      try {
+        site = await getSiteBySlug(req.params.siteName);
+      } catch (error) {
+        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
+      }
+    }
+    
     if (!site?.neocore?.enabled) {
       return res.status(404).json({ error: 'Site not found' });
     }
@@ -481,8 +640,19 @@ function registerNeocoreRoutes(app, allSites, server) {
   });
 
   // Root-level images/icons
-  app.get('/vpn/:siteName/neocore/:assetFile', (req, res) => {
-    const site = allSites[req.params.siteName];
+  app.get('/vpn/:siteName/neocore/:assetFile', async (req, res) => {
+    const currentSites = getCurrentSites();
+    let site = currentSites[req.params.siteName];
+    
+    // If not in static config, try database lookup
+    if (!site?.neocore?.enabled) {
+      try {
+        site = await getSiteBySlug(req.params.siteName);
+      } catch (error) {
+        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
+      }
+    }
+    
     if (!site?.neocore?.enabled || req.params.assetFile.startsWith('api') || req.params.assetFile === 'static') {
       return res.status(404).json({ error: 'Not found' });
     }
@@ -499,8 +669,19 @@ function registerNeocoreRoutes(app, allSites, server) {
   });
 
   // Catch-all for React Router (MUST be last)
-  app.get('/vpn/:siteName/neocore/*', (req, res) => {
-    const site = allSites[req.params.siteName];
+  app.get('/vpn/:siteName/neocore/*', async (req, res) => {
+    const currentSites = getCurrentSites();
+    let site = currentSites[req.params.siteName];
+    
+    // If not in static config, try database lookup
+    if (!site?.neocore?.enabled) {
+      try {
+        site = await getSiteBySlug(req.params.siteName);
+      } catch (error) {
+        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
+      }
+    }
+    
     if (!site?.neocore?.enabled || req.url.includes('/api') || req.url.includes('/socket.io')) {
       return res.status(404).json({ error: 'Not found' });
     }
@@ -512,12 +693,23 @@ function registerNeocoreRoutes(app, allSites, server) {
  * Register device routes for all sites
  * URL Structure: /vpn/{site}/devices/{deviceId}/*
  * Devices routes MUST be registered BEFORE neocore routes to avoid conflicts
+ * 
+ * @param {Express} app - Express application instance
+ * @param {Object|Function} sitesOrGetter - Site configuration object OR function that returns current sites
  */
-function registerDevicesRoutes(app, allSites) {
+function registerDevicesRoutes(app, sitesOrGetter) {
+  // Helper function to get current sites (supports both object and getter function)
+  const getCurrentSites = () => {
+    if (typeof sitesOrGetter === 'function') {
+      return sitesOrGetter();
+    }
+    return sitesOrGetter;
+  };
+
   // CRITICAL: Universal middleware for ALL device assets
   // Catches root-level requests and rewrites them to device-specific paths
   // This handles ANY asset file from ANY device (JS, CSS, images, etc.)
-  app.use((req, res, next) => {
+  app.use(async (req, res, next) => {
     const url = req.url || '';
     
     // Skip routes that shouldn't be rewritten
@@ -530,9 +722,10 @@ function registerDevicesRoutes(app, allSites) {
       return next();
     }
     
-    // Detect device from referer
+    // Detect device from referer (with runtime database lookup)
     const referer = req.headers.referer || '';
-    const deviceInfo = detectDeviceFromReferer(referer, allSites);
+    const currentSites = getCurrentSites();
+    const deviceInfo = await detectDeviceFromReferer(referer, getCurrentSites);
     
     if (deviceInfo) {
       const { site, deviceId } = deviceInfo;
@@ -544,8 +737,9 @@ function registerDevicesRoutes(app, allSites) {
     next();
   });
 
-  // Register individual device routes for each site
-  Object.values(allSites).forEach(site => {
+  // Register individual device routes for each site (from static config)
+  const currentSitesForRegistration = getCurrentSites();
+  Object.values(currentSitesForRegistration).forEach(site => {
     if (site.devices?.enabled && site.devices.deviceList) {
       // Register route for each device in deviceList
       Object.entries(site.devices.deviceList).forEach(([deviceId, deviceConfig]) => {
@@ -563,19 +757,72 @@ function registerDevicesRoutes(app, allSites) {
     }
   });
   
-  console.log(`✅ Universal device asset handler active - handles ANY device from ANY site`);
+  // Dynamic device route handler - handles devices from database (runtime lookup)
+  app.use('/vpn/:siteName/devices/:deviceId', async (req, res, next) => {
+    const siteSlug = req.params.siteName;
+    const deviceId = req.params.deviceId;
+    
+    // Check static config first
+    const currentSites = getCurrentSites();
+    let site = currentSites[siteSlug];
+    
+    // If not in static config, try database lookup
+    if (!site || !site.devices?.deviceList?.[deviceId]) {
+      console.log(`🔍 Device ${deviceId} not in static config for site ${siteSlug}, checking database...`);
+      try {
+        site = await getSiteBySlug(siteSlug);
+        if (site && site.devices?.deviceList?.[deviceId]) {
+          console.log(`✅ Found device ${deviceId} for site ${siteSlug} in database`);
+        } else {
+          console.log(`⚠️  Device ${deviceId} not found for site ${siteSlug}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error looking up site ${siteSlug}:`, error.message);
+      }
+    }
+    
+    // If site/device found, create proxy on-the-fly
+    if (site?.devices?.deviceList?.[deviceId]) {
+      const deviceConfig = site.devices.deviceList[deviceId];
+      const proxy = createDeviceProxy(site, deviceId, deviceConfig);
+      if (proxy) {
+        // Remove the route prefix and pass to proxy
+        const originalUrl = req.url;
+        req.url = req.url.replace(`/vpn/${siteSlug}/devices/${deviceId}`, '') || '/';
+        console.log(`🔄 Dynamic device proxy: ${originalUrl} → ${deviceConfig.target}${req.url}`);
+        return proxy(req, res, next);
+      }
+    }
+    
+    // Not found - continue to next middleware (will return 404)
+    next();
+  });
+  
+  console.log(`✅ Universal device asset handler active - handles ANY device from ANY site (static + dynamic)`);
 }
 
 /**
  * Register all routes
  * IMPORTANT: Device routes MUST be registered BEFORE neocore routes
+ * 
+ * @param {Express} app - Express application instance
+ * @param {Object|Function} sitesOrGetter - Site configuration object OR function that returns current sites
+ * @param {http.Server} server - HTTP server instance for WebSocket support
  */
-function registerAllRoutes(app, sites, server) {
+function registerAllRoutes(app, sitesOrGetter, server) {
+  // Helper function to get current sites (supports both object and getter function)
+  const getSites = () => {
+    if (typeof sitesOrGetter === 'function') {
+      return sitesOrGetter();
+    }
+    return sitesOrGetter;
+  };
+  
   // Register devices routes FIRST to avoid conflicts
-  registerDevicesRoutes(app, sites);
+  registerDevicesRoutes(app, getSites);
   
   // Then register neocore routes
-  registerNeocoreRoutes(app, sites, server);
+  registerNeocoreRoutes(app, getSites, server);
 }
 
 module.exports = { registerAllRoutes };
