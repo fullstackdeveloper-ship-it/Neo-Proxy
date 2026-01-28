@@ -4,6 +4,7 @@
  */
 
 const { createProxyMiddleware } = require("http-proxy-middleware");
+const httpProxy = require("http-proxy");
 const { createDeviceProxy } = require("./proxyFactory");
 const { serveAsset, serveHTML } = require("./assetsService");
 const fs = require('fs');
@@ -190,7 +191,7 @@ function registerNeocoreRoutes(app, allSites, server) {
     const handledUpgrades = new WeakSet();
     
     // Add upgrade listener that runs FIRST (before middleware handlers)
-    // Use prependListener to ensure it runs before middleware's handlers
+    // Use prependListener to ensure i  t runs before middleware's handlers
     server.prependListener('upgrade', (req, socket, head) => {
       // Prevent double handling
       if (handledUpgrades.has(req)) {
@@ -206,23 +207,32 @@ function registerNeocoreRoutes(app, allSites, server) {
         const cookieHeader = req.headers.cookie || '';
         
         console.log(`🔌 WebSocket upgrade: ${url}`);
+        console.log(`   Cookie: ${cookieHeader}`);
         console.log(`   Origin: ${origin}, Referer: ${referer}`);
         
-        // Detect site - try multiple methods
-        let targetSite = detectSite(req, allSites);
+        let targetSite = null;
         
-        // If not detected, try cookie (most reliable for WebSocket)
-        if (!targetSite?.neocore?.enabled && cookieHeader) {
-          const cookieMatch = cookieHeader.match(/vpn-site=([^;]+)/);
+        // Priority 1: Cookie (most reliable for WebSocket - set when page loads)
+        if (cookieHeader) {
+          const cookieMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
           if (cookieMatch) {
-            targetSite = allSites[cookieMatch[1]];
+            const siteName = cookieMatch[1].trim();
+            targetSite = allSites[siteName];
             if (targetSite?.neocore?.enabled) {
               console.log(`   🍪 Detected site from cookie: ${targetSite.name}`);
             }
           }
         }
         
-        // If still not detected, try referer
+        // Priority 2: Try detectSite function (checks URL, referer, origin, cookie)
+        if (!targetSite?.neocore?.enabled) {
+          targetSite = detectSite(req, allSites);
+          if (targetSite?.neocore?.enabled) {
+            console.log(`   🔍 Detected site from detectSite: ${targetSite.name}`);
+          }
+        }
+        
+        // Priority 3: Try referer directly (fallback)
         if (!targetSite?.neocore?.enabled && referer) {
           const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
           if (refererMatch) {
@@ -233,7 +243,7 @@ function registerNeocoreRoutes(app, allSites, server) {
           }
         }
         
-        // Last resort: fallback to first enabled site
+        // Priority 4: Last resort - fallback to first enabled site
         if (!targetSite?.neocore?.enabled) {
           targetSite = Object.values(allSites).find(s => s.neocore?.enabled);
           if (targetSite) {
@@ -242,19 +252,42 @@ function registerNeocoreRoutes(app, allSites, server) {
         }
         
         if (targetSite?.neocore?.enabled) {
-          // Rewrite URL - middleware will handle the upgrade automatically
+          // Rewrite URL and manually proxy the upgrade
           const queryString = url.includes('?') ? url.substring(url.indexOf('?')) : '';
-          url = `/vpn/${targetSite.name}/neocore/socket.io${queryString}`;
-          req.url = url;
+          const newUrl = `/socket.io${queryString}`; // Path after rewrite (removes /vpn/site/neocore prefix)
+          req.url = newUrl;
           handledUpgrades.add(req);
-          console.log(`   ✅ Rewritten to: ${url} → ${targetSite.name}`);
+          
+          console.log(`   ✅ Rewritten: ${url} → ${newUrl} (site: ${targetSite.name}, target: ${targetSite.neocore.target})`);
+          
+          // Manually proxy the upgrade using http-proxy
+          const proxy = httpProxy.createProxyServer({
+            target: targetSite.neocore.target,
+            ws: true,
+            changeOrigin: true,
+            secure: false
+          });
+          
+          proxy.on('error', (err, req, socket) => {
+            const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
+            if (!suppressErrors.includes(err.code)) {
+              console.error(`   ❌ WebSocket proxy error (${targetSite.name}):`, err.message);
+            }
+            if (!socket.destroyed) {
+              socket.destroy();
+            }
+          });
+          
+          proxy.ws(req, socket, head);
+          return; // Don't let other handlers process this
         } else {
           console.error(`   ❌ No site detected, closing connection`);
+          console.error(`   Available sites: ${Object.keys(allSites).join(', ')}`);
           socket.destroy();
           return;
         }
       }
-      // Let the request continue - middleware will handle the upgrade for matching routes
+      // For URLs with site prefix, let middleware handle it
     });
     
     console.log(`✅ WebSocket URL rewrite handler registered (middleware will handle upgrades)`);
