@@ -1,6 +1,6 @@
 /**
- * Site Cache Service
- * Provides runtime lookup and caching of site configurations by slug
+ * Site Lookup Service
+ * Provides runtime lookup of site configurations by slug (no caching - fresh DB lookup every time)
  */
 
 const { createDatabasePool } = require('../config/database');
@@ -15,14 +15,8 @@ function setDatabasePool(pool) {
 function getPool() {
   return dbPool;
 }
-const { transformDashboardsToSites } = require('./databaseService');
+const { transformRemoteAccessToSites } = require('./databaseService');
 const { isValidSiteSlug, sanitizeSiteSlug } = require('../utils/siteSlugValidator');
-
-// In-memory cache: { siteSlug: { siteConfig, lastUpdated, expiresAt } }
-const siteCache = new Map();
-
-// Cache TTL: 5 minutes
-const CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
  * Lookup site configuration by slug from database
@@ -98,7 +92,7 @@ async function lookupSiteBySlug(siteSlug) {
 }
 
 /**
- * Get site configuration from cache or database
+ * Get site configuration from database (no caching - fresh lookup every time)
  * @param {string} siteSlug - Site slug to lookup
  * @returns {Promise<Object|null>} Site configuration or null if not found
  */
@@ -107,97 +101,16 @@ async function getSiteBySlug(siteSlug) {
     return null;
   }
 
-  // Check cache first
-  const cached = siteCache.get(siteSlug);
-  if (cached) {
-    const now = Date.now();
-    if (cached.expiresAt > now) {
-      // Cache hit - return cached configuration
-      console.log(`💾 Cache hit for site: ${siteSlug}`);
-      return cached.siteConfig;
-    } else {
-      // Cache expired - remove it
-      console.log(`⏰ Cache expired for site: ${siteSlug}`);
-      siteCache.delete(siteSlug);
-    }
-  }
-
-  // Cache miss - lookup from database
-  console.log(`🔍 Cache miss for site: ${siteSlug} - looking up in database...`);
+  // Always do fresh database lookup (no caching)
+  console.log(`🔍 Looking up site in database: ${siteSlug}`);
   const siteConfig = await lookupSiteBySlug(siteSlug);
 
-  if (siteConfig) {
-    // Store in cache
-    const now = Date.now();
-    siteCache.set(siteSlug, {
-      siteConfig,
-      lastUpdated: now,
-      expiresAt: now + CACHE_TTL_MS,
-    });
-    console.log(`💾 Cached site configuration for: ${siteSlug}`);
-  } else {
-    // Not found - cache negative result for shorter time (1 minute)
-    const now = Date.now();
-    siteCache.set(siteSlug, {
-      siteConfig: null,
-      lastUpdated: now,
-      expiresAt: now + 60 * 1000, // 1 minute for negative cache
-    });
-    console.log(`⚠️  Site not found: ${siteSlug} - cached negative result`);
-  }
-
   return siteConfig;
-}
-
-/**
- * Invalidate cache for a specific site slug
- * @param {string} siteSlug - Site slug to invalidate
- */
-function invalidateSiteCache(siteSlug) {
-  if (siteSlug) {
-    siteCache.delete(siteSlug);
-    console.log(`🗑️  Invalidated cache for site: ${siteSlug}`);
-  }
-}
-
-/**
- * Clear all site cache
- */
-function clearSiteCache() {
-  siteCache.clear();
-  console.log('🗑️  Cleared all site cache');
-}
-
-/**
- * Get cache statistics
- * @returns {Object} Cache statistics
- */
-function getCacheStats() {
-  const now = Date.now();
-  let validEntries = 0;
-  let expiredEntries = 0;
-
-  siteCache.forEach((cached) => {
-    if (cached.expiresAt > now) {
-      validEntries++;
-    } else {
-      expiredEntries++;
-    }
-  });
-
-  return {
-    totalEntries: siteCache.size,
-    validEntries,
-    expiredEntries,
-  };
 }
 
 module.exports = {
   getSiteBySlug,
   lookupSiteBySlug,
-  invalidateSiteCache,
-  clearSiteCache,
-  getCacheStats,
   setDatabasePool,
   getPool,
 };

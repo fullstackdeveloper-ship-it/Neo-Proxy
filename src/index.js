@@ -2,6 +2,7 @@
  * VPN Proxy Service - Main Entry Point
  */
 
+require('dotenv').config();
 const express = require("express");
 const http = require("http");
 const cookieParser = require("cookie-parser");
@@ -50,32 +51,31 @@ async function initializeDatabase() {
     // Check if database environment variables are set
     const dbHost = process.env.DB_HOST;
     if (!dbHost) {
-      console.log('⚠️  DB_HOST not set. Using static site configuration.');
-      return;
+      console.error('❌ DB_HOST not set in .env file. Please configure database connection.');
+      console.error('   Required: DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME');
+      process.exit(1);
     }
 
-    console.log('📊 Initializing database connection...');
+    console.log('📊 Connecting to database...');
+    console.log(`   DB_HOST: ${dbHost}`);
+    console.log(`   DB_PORT: ${process.env.DB_PORT || '5432'}`);
+    console.log(`   DB_NAME: ${process.env.DB_NAME || 'solar_db'}`);
+    
     dbPool = createDatabasePool();
     
     const connected = await testConnection(dbPool);
     if (!connected) {
-      console.log('⚠️  Database connection failed. Using static site configuration.');
-      dbPool = null;
-      return;
+      console.error('❌ Database connection failed. Please check your database configuration.');
+      process.exit(1);
     }
 
-    // Load site configurations from database
-    const dbSites = await getSiteConfigurations(dbPool);
-    if (dbSites && Object.keys(dbSites).length > 0) {
-      updateSitesConfiguration(dbSites);
-      console.log('✅ Using database-driven site configurations');
-    } else {
-      console.log('⚠️  No database configurations found. Using static site configuration.');
-    }
+    // Set database pool for runtime lookups (no preloading - load on demand)
+    setDatabasePool(dbPool);
+    console.log('✅ Database connected successfully - sites will be loaded on demand from DB');
   } catch (error) {
     console.error('❌ Database initialization error:', error.message);
-    console.log('⚠️  Falling back to static site configuration.');
-    dbPool = null;
+    console.error('   Please check your .env file and database server.');
+    process.exit(1);
   }
 }
 
@@ -282,11 +282,6 @@ async function startServer() {
   
   // Store reference for route updates
   routeManager = { updateSites: (newSites) => { SITES = newSites; } };
-
-  // Start configuration refresh if database is available
-  if (dbPool) {
-    startConfigurationRefresh();
-  }
 
   server.listen(PORT, HOST, () => {
     console.log(`\n✅ VPN Proxy Service → http://${HOST}:${PORT}\n`);
