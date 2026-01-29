@@ -283,40 +283,25 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
     }
   });
 
-  // Root-level API route handler (for /api/* requests without site prefix)
-  // Rewrites to /vpn/{site}/neocore/api/* and proxies to backend
-  app.use('/api', async (req, res, next) => {
-    // Skip if already has site prefix
-    if (req.url.startsWith('/vpn/')) {
-      return next();
-    }
-
-    const currentSites = getCurrentSites();
-    const site = await detectSite(req, currentSites);
-    
-    if (site?.neocore?.enabled) {
-      // Get or create API proxy for this site
-      let apiProxy = apiProxies.get(site.name);
-      if (!apiProxy) {
-        // Create proxy dynamically for DB-loaded sites
-        console.log(`🔧 Creating dynamic API proxy for site: ${site.name}`);
-        apiProxy = createProxy(
-          site.neocore.target,
-          { [`^/vpn/${site.name}/neocore/api`]: '/api' },
-          site.name
-        );
-        apiProxies.set(site.name, apiProxy);
+  // URL rewrite interceptors (for HTTP requests - socket.io polling, API calls)
+  // Use getter function to get current sites dynamically (already defined above)
+  
+  app.use((req, res, next) => {
+    // Only intercept API requests without site prefix
+    // IMPORTANT: Do NOT rewrite /socket.io here. Express mounts strip prefixes (e.g. '/socket.io' -> '/'),
+    // and doing it in two places causes subtle path/query bugs that break Engine.IO.
+    if (req.url.startsWith('/api') && !req.url.startsWith('/vpn/')) {
+      const currentSites = getCurrentSites();
+      const site = detectSite(req, currentSites);
+      if (site?.neocore?.enabled) {
+        const prefix = `/vpn/${site.name}/neocore`;
+        req.url = `${prefix}${req.url}`;
+        console.log(`🔄 API rewrite: ${req.url} → ${site.name} (from ${req.headers.referer || 'direct'})`);
+      } else {
+        console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
       }
-      
-      console.log(`🔄 Root API rewrite: ${req.url} → ${site.name}/neocore/api${req.url} (from ${req.headers.referer || 'direct'})`);
-      // Rewrite URL to include site prefix (proxy will strip /vpn/{site}/neocore/api)
-      const originalUrl = req.url;
-      req.url = `/vpn/${site.name}/neocore/api${originalUrl}`;
-      return apiProxy(req, res, next);
-    } else {
-      console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
-      res.status(404).json({ error: 'API endpoint not found - no site detected' });
     }
+    next();
   });
 
   // Register site-specific socket.io routes (MUST be before root-level route)

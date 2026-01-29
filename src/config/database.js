@@ -12,9 +12,9 @@ function createDatabasePool() {
   const pool = new Pool({
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '5432', 10),
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASS || 'postgres',
-    database: process.env.DB_NAME || 'mydb',
+    user: process.env.DB_USER || 'solar',
+    password: process.env.DB_PASS || 'solarpass',
+    database: process.env.DB_NAME || 'solar_db',
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
     max: 10, // Maximum number of clients in the pool
     idleTimeoutMillis: 30000, // Close idle clients after 30 seconds

@@ -2,21 +2,13 @@
  * VPN Proxy Service - Main Entry Point
  */
 
-// Load environment variables from .env if present (optional; doesn't break deployments without dotenv)
-try {
-  // eslint-disable-next-line global-require
-  require('dotenv').config();
-} catch (e) {
-  // dotenv is optional in this project; env vars may be provided by systemd/docker instead
-}
-
 const express = require("express");
 const http = require("http");
 const cookieParser = require("cookie-parser");
 const STATIC_SITES = require("./config/sites"); // Static fallback configuration
 const { createDatabasePool, testConnection } = require("./config/database");
 const { getSiteConfigurations, refreshSiteConfigurations } = require("./services/databaseService");
-const { setDatabasePool, preloadAllSitesToCache } = require("./services/siteCacheService");
+const { setDatabasePool } = require("./services/siteCacheService");
 const { registerAllRoutes } = require("./services/routeManager");
 const { registerTestRoutes } = require("./routes/testRoutes");
 
@@ -55,43 +47,34 @@ function updateSitesConfiguration(newSites) {
 
 async function initializeDatabase() {
   try {
-    // Always try to connect to database (use defaults if env vars not set)
-    const dbHost = process.env.DB_HOST || 'localhost';
-    const dbPort = process.env.DB_PORT || '5432';
-    const dbName = process.env.DB_NAME || 'mydb';
-    const dbUser = process.env.DB_USER || 'postgres';
-    
-    console.log(
-      `📊 Initializing database connection (host=${dbHost}, port=${dbPort}, db=${dbName}, user=${dbUser})...`,
-    );
-    
+    // Check if database environment variables are set
+    const dbHost = process.env.DB_HOST;
+    if (!dbHost) {
+      console.log('⚠️  DB_HOST not set. Using static site configuration.');
+      return;
+    }
+
+    console.log('📊 Initializing database connection...');
     dbPool = createDatabasePool();
-    // Make pool available to runtime lookup/caching layer
-    setDatabasePool(dbPool);
     
     const connected = await testConnection(dbPool);
     if (!connected) {
-      console.log('⚠️  Database connection failed. Will use static site configuration as fallback.');
-      setDatabasePool(null);
+      console.log('⚠️  Database connection failed. Using static site configuration.');
       dbPool = null;
       return;
     }
 
-    // Preload all sites from database into cache (for fast runtime lookups)
-    const preloadedCount = await preloadAllSitesToCache();
-    
-    // Also load site configurations for route registration
+    // Load site configurations from database
     const dbSites = await getSiteConfigurations(dbPool);
     if (dbSites && Object.keys(dbSites).length > 0) {
       updateSitesConfiguration(dbSites);
-      console.log(`✅ Using database-driven site configurations (${Object.keys(dbSites).length} sites, ${preloadedCount} cached)`);
+      console.log('✅ Using database-driven site configurations');
     } else {
       console.log('⚠️  No database configurations found. Using static site configuration.');
     }
   } catch (error) {
     console.error('❌ Database initialization error:', error.message);
     console.log('⚠️  Falling back to static site configuration.');
-    setDatabasePool(null);
     dbPool = null;
   }
 }
@@ -106,8 +89,6 @@ function startConfigurationRefresh() {
       console.log('🔄 Refreshing site configurations from database...');
       const dbSites = await refreshSiteConfigurations(dbPool);
       updateSitesConfiguration(dbSites);
-      // Also refresh cache
-      await preloadAllSitesToCache();
     } catch (error) {
       console.error('❌ Error refreshing configurations:', error.message);
     }
@@ -126,15 +107,11 @@ app.get("/refresh-config", async (req, res) => {
   try {
     const dbSites = await refreshSiteConfigurations(dbPool);
     const updated = updateSitesConfiguration(dbSites);
-    // Also refresh cache
-    const preloadedCount = await preloadAllSitesToCache();
-    
     if (updated) {
       res.json({ 
         success: true, 
         message: "Configurations refreshed",
-        siteCount: Object.keys(SITES).length,
-        cachedSites: preloadedCount
+        siteCount: Object.keys(SITES).length
       });
     } else {
       res.json({ 

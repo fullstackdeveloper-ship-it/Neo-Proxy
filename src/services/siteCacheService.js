@@ -4,8 +4,6 @@
  */
 
 const { createDatabasePool } = require('../config/database');
-const { transformRemoteAccessToSites } = require('./databaseService');
-const { isValidSiteSlug, sanitizeSiteSlug } = require('../utils/siteSlugValidator');
 
 // Get pool instance (will be set by index.js)
 let dbPool = null;
@@ -17,6 +15,8 @@ function setDatabasePool(pool) {
 function getPool() {
   return dbPool;
 }
+const { transformDashboardsToSites } = require('./databaseService');
+const { isValidSiteSlug, sanitizeSiteSlug } = require('../utils/siteSlugValidator');
 
 // In-memory cache: { siteSlug: { siteConfig, lastUpdated, expiresAt } }
 const siteCache = new Map();
@@ -80,8 +80,7 @@ async function lookupSiteBySlug(siteSlug) {
     }
 
     // Transform remote access configs to site configuration
-    // (databaseService exports this transformer under the legacy name transformDashboardsToSites)
-    const sitesMap = transformDashboardsToSites(result.rows);
+    const sitesMap = transformRemoteAccessToSites(result.rows);
     const siteConfig = sitesMap[validSlug];
 
     if (!siteConfig) {
@@ -99,79 +98,7 @@ async function lookupSiteBySlug(siteSlug) {
 }
 
 /**
- * Preload all sites from database into cache
- * This should be called at startup to populate cache with all available sites
- * @returns {Promise<number>} Number of sites preloaded
- */
-async function preloadAllSitesToCache() {
-  const pool = getPool();
-  if (!pool) {
-    console.warn('⚠️  Database pool not available - cannot preload sites to cache');
-    return 0;
-  }
-
-  try {
-    console.log('📊 Preloading all sites from database into cache...');
-    
-    // Fetch all remote access configurations
-    const query = `
-      SELECT 
-        ra.id,
-        ra.name,
-        ra.site_id,
-        ra.vpn_config_id,
-        ra.vpn_ip,
-        ra.neocore_enabled,
-        ra.devices,
-        ra.is_active,
-        ra.display_order,
-        s.slug as site_slug,
-        s.name as site_name
-      FROM remote_access ra
-      INNER JOIN sites s ON ra.site_id = s.id
-      WHERE ra.vpn_ip IS NOT NULL
-        AND ra.is_active = true
-      ORDER BY s.slug, ra.display_order
-    `;
-
-    const result = await pool.query(query);
-    
-    if (result.rows.length === 0) {
-      console.log('ℹ️  No remote access configurations found to preload');
-      return 0;
-    }
-
-    // Transform and group by site slug
-    const sitesMap = transformRemoteAccessToSites(result.rows);
-    const siteSlugs = Object.keys(sitesMap);
-    
-    // Preload each site into cache
-    const now = Date.now();
-    let preloadedCount = 0;
-    
-    siteSlugs.forEach((siteSlug) => {
-      const siteConfig = sitesMap[siteSlug];
-      if (siteConfig) {
-        siteCache.set(siteSlug, {
-          siteConfig,
-          lastUpdated: now,
-          expiresAt: now + CACHE_TTL_MS,
-        });
-        preloadedCount++;
-      }
-    });
-
-    console.log(`✅ Preloaded ${preloadedCount} site(s) into cache: ${siteSlugs.join(', ')}`);
-    return preloadedCount;
-  } catch (error) {
-    console.error(`❌ Error preloading sites to cache: ${error.message}`);
-    return 0;
-  }
-}
-
-/**
  * Get site configuration from cache or database
- * Uses cache-first approach: check cache, if miss and DB available, lookup and cache
  * @param {string} siteSlug - Site slug to lookup
  * @returns {Promise<Object|null>} Site configuration or null if not found
  */
@@ -180,7 +107,7 @@ async function getSiteBySlug(siteSlug) {
     return null;
   }
 
-  // Check cache first (cache hit)
+  // Check cache first
   const cached = siteCache.get(siteSlug);
   if (cached) {
     const now = Date.now();
@@ -193,13 +120,6 @@ async function getSiteBySlug(siteSlug) {
       console.log(`⏰ Cache expired for site: ${siteSlug}`);
       siteCache.delete(siteSlug);
     }
-  }
-
-  // Cache miss - try database lookup if available
-  const pool = getPool();
-  if (!pool) {
-    console.warn(`⚠️  Cache miss for site: ${siteSlug} - database not available`);
-    return null;
   }
 
   // Cache miss - lookup from database
@@ -275,7 +195,6 @@ function getCacheStats() {
 module.exports = {
   getSiteBySlug,
   lookupSiteBySlug,
-  preloadAllSitesToCache,
   invalidateSiteCache,
   clearSiteCache,
   getCacheStats,
