@@ -134,7 +134,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
+// Health check (multiple neocores and devices per site)
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -143,39 +143,41 @@ app.get("/health", (req, res) => {
     configurationSource: dbPool ? "database" : "static",
     sites: Object.values(SITES).map(site => ({
       name: site.name,
-      vpnIp: site.vpnIp,              // VPN transport IP (10.9.0.x)
-      neocore: { 
-        enabled: site.neocore?.enabled || false, 
-        target: site.neocore?.target 
-      },
-      devices: { 
+      siteName: site.siteName || site.name,
+      neocores: site.neocores ? Object.entries(site.neocores).map(([id, nc]) => ({
+        id,
+        name: nc.name || id,
+        target: nc.target,
+        wsTarget: nc.wsTarget,
+        url: `/vpn/${site.name}/neocore/${id}`,
+      })) : [],
+      devices: {
         enabled: site.devices?.enabled || false,
         deviceCount: site.devices?.deviceList ? Object.keys(site.devices.deviceList).length : 0,
         deviceList: site.devices?.deviceList ? Object.entries(site.devices.deviceList).map(([id, config]) => ({
           id,
           name: config.name || id,
           virtualIp: config.virtualIp,
-          target: config.target
-        })) : []
-      }
-    }))
+          target: config.target,
+          url: `/vpn/${site.name}/devices/${id}`,
+        })) : [],
+      },
+    })),
   });
 });
 
-// Backend connectivity test endpoint
-app.get("/test-backend/:siteName", async (req, res) => {
-  const siteName = req.params.siteName;
+// Backend connectivity test: /test-backend/:siteName/:neocoreId (multiple neocores per site)
+app.get("/test-backend/:siteName/:neocoreId", async (req, res) => {
+  const { siteName, neocoreId } = req.params;
   const site = SITES[siteName];
-  
-  if (!site || !site.neocore?.enabled) {
-    return res.status(404).json({ error: "Site not found or not enabled" });
+  const neocoreConfig = site?.neocores?.[neocoreId];
+
+  if (!site || !neocoreConfig) {
+    return res.status(404).json({ error: "Site or NeoCore not found" });
   }
-  
-  const http = require('http');
-  const url = require('url');
-  const targetUrl = url.parse(site.neocore.target);
-  
-  // Test HTTP connectivity
+
+  const targetUrl = new URL(neocoreConfig.target);
+
   const testHttp = () => {
     return new Promise((resolve) => {
       const options = {
@@ -183,27 +185,17 @@ app.get("/test-backend/:siteName", async (req, res) => {
         port: targetUrl.port || 80,
         path: '/api/health',
         method: 'GET',
-        timeout: 5000
+        timeout: 5000,
       };
-      
-      const req = http.request(options, (res) => {
-        resolve({ success: true, statusCode: res.statusCode });
+      const r = require('http').request(options, (resp) => {
+        resolve({ success: true, statusCode: resp.statusCode });
       });
-      
-      req.on('error', (err) => {
-        resolve({ success: false, error: err.message, code: err.code });
-      });
-      
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({ success: false, error: 'Connection timeout' });
-      });
-      
-      req.end();
+      r.on('error', (err) => resolve({ success: false, error: err.message, code: err.code }));
+      r.on('timeout', () => { r.destroy(); resolve({ success: false, error: 'Connection timeout' }); });
+      r.end();
     });
   };
-  
-  // Test WebSocket endpoint (socket.io polling)
+
   const testSocketIO = () => {
     return new Promise((resolve) => {
       const options = {
@@ -211,37 +203,27 @@ app.get("/test-backend/:siteName", async (req, res) => {
         port: targetUrl.port || 80,
         path: '/socket.io/?EIO=4&transport=polling',
         method: 'GET',
-        timeout: 5000
+        timeout: 5000,
       };
-      
-      const req = http.request(options, (res) => {
-        resolve({ success: true, statusCode: res.statusCode });
+      const r = require('http').request(options, (resp) => {
+        resolve({ success: true, statusCode: resp.statusCode });
       });
-      
-      req.on('error', (err) => {
-        resolve({ success: false, error: err.message, code: err.code });
-      });
-      
-      req.on('timeout', () => {
-        req.destroy();
-        resolve({ success: false, error: 'Connection timeout' });
-      });
-      
-      req.end();
+      r.on('error', (err) => resolve({ success: false, error: err.message, code: err.code }));
+      r.on('timeout', () => { r.destroy(); resolve({ success: false, error: 'Connection timeout' }); });
+      r.end();
     });
   };
-  
+
   const [httpTest, socketIOTest] = await Promise.all([testHttp(), testSocketIO()]);
-  
+
   res.json({
     site: siteName,
-    target: site.neocore.target,
-    vpnIp: site.vpnIp,
-    tests: {
-      http: httpTest,
-      socketIO: socketIOTest
-    },
-    status: httpTest.success && socketIOTest.success ? 'healthy' : 'unhealthy'
+    neocoreId,
+    target: neocoreConfig.target,
+    wsTarget: neocoreConfig.wsTarget,
+    url: `/vpn/${siteName}/neocore/${neocoreId}`,
+    tests: { http: httpTest, socketIO: socketIOTest },
+    status: httpTest.success && socketIOTest.success ? 'healthy' : 'unhealthy',
   });
 });
 
@@ -289,12 +271,14 @@ async function startServer() {
     console.log(`   📊 Configuration: ${dbPool ? 'Database-driven' : 'Static file'}\n`);
     
     Object.values(SITES).forEach(s => {
-      if (s.neocore?.enabled) {
-        console.log(`   🌐 /vpn/${s.name}/neocore → ${s.neocore.target} (VPN IP: ${s.vpnIp})`);
+      if (s.neocores && Object.keys(s.neocores).length > 0) {
+        Object.entries(s.neocores).forEach(([neocoreId, nc]) => {
+          console.log(`   🌐 /vpn/${s.name}/neocore/${neocoreId} → ${nc.target} (${nc.name || neocoreId})`);
+        });
       }
       if (s.devices?.enabled && s.devices.deviceList) {
         const deviceCount = Object.keys(s.devices.deviceList).length;
-        console.log(`   🔧 /vpn/${s.name}/devices/* → ${deviceCount} device(s) configured`);
+        console.log(`   🔧 /vpn/${s.name}/devices/* → ${deviceCount} device(s)`);
         Object.entries(s.devices.deviceList).forEach(([deviceId, deviceConfig]) => {
           console.log(`      └─ /vpn/${s.name}/devices/${deviceId} → ${deviceConfig.target} (${deviceConfig.name || deviceId})`);
         });

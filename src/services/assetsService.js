@@ -67,33 +67,46 @@ function serveAsset(req, res) {
 
 /**
  * Serve HTML with base tag injection
+ * @param {Object} req - Express request
+ * @param {Object} res - Express response
+ * @param {string} siteName - Site slug
+ * @param {string} neocoreId - NeoCore instance slug (e.g. '0', '1') for multiple neocores per site
  */
-function serveHTML(req, res, siteName) {
+function serveHTML(req, res, siteName, neocoreId) {
   try {
     const htmlPath = path.join(BUILD_DIR, 'index.html');
     if (!fs.existsSync(htmlPath)) {
       return res.status(404).json({ error: 'Frontend build not found' });
     }
-    
+
     let html = fs.readFileSync(htmlPath, 'utf8');
-    
+
     if (siteName) {
-      const basePath = `/vpn/${siteName}/neocore`;
+      const basePath = neocoreId
+        ? `/vpn/${siteName}/neocore/${neocoreId}`
+        : `/vpn/${siteName}/neocore`;
       if (!html.includes('<base')) {
         html = html.replace('<head>', `<head>\n<base href="${basePath}/">`);
       } else {
         html = html.replace(/<base[^>]*>/, `<base href="${basePath}/">`);
       }
-      
-      // Set cookie to track site for WebSocket connections
+
       res.cookie('vpn-site', siteName, {
-        httpOnly: false, // Allow JavaScript to read it if needed
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        httpOnly: false,
+        maxAge: 24 * 60 * 60 * 1000,
         path: '/',
-        sameSite: 'lax'
+        sameSite: 'lax',
       });
+      if (neocoreId) {
+        res.cookie('vpn-neocore', neocoreId, {
+          httpOnly: false,
+          maxAge: 24 * 60 * 60 * 1000,
+          path: '/',
+          sameSite: 'lax',
+        });
+      }
     }
-    
+
     res.setHeader('Content-Type', 'text/html');
     res.send(html);
   } catch (err) {

@@ -1,34 +1,37 @@
 /**
  * Database Service
- * Fetches dashboard configurations from NeoSphere database
+ * Fetches remote access configurations from NeoSphere database
+ * Single table: remote_access with type ('neocore'|'device'), slug, ip, site_id
+ * Port 80 for HTTP, 5001 for WebSocket (fixed)
  */
 
 const { isValidSiteSlug, sanitizeSiteSlug } = require('../utils/siteSlugValidator');
 
+const HTTP_PORT = 80;
+const WS_PORT = 5001;
+
 /**
- * Fetch all dashboards with remote access enabled
- * Returns dashboards grouped by site slug
+ * Fetch all remote_access rows (neocore and device) with site info
  */
 async function fetchRemoteAccessConfigurations(pool) {
   try {
     const query = `
       SELECT 
         ra.id,
-        ra.name,
         ra.site_id,
-        ra.vpn_config_id,
-        ra.vpn_ip,
-        ra.neocore_enabled,
-        ra.devices,
+        ra.type,
+        ra.slug,
+        ra.name,
+        ra.ip,
         ra.is_active,
         ra.display_order,
         s.slug as site_slug,
         s.name as site_name
       FROM remote_access ra
       INNER JOIN sites s ON ra.site_id = s.id
-      WHERE ra.vpn_ip IS NOT NULL
+      WHERE ra.ip IS NOT NULL
         AND ra.is_active = true
-      ORDER BY s.slug, ra.display_order
+      ORDER BY s.slug, ra.type, ra.display_order
     `;
 
     const result = await pool.query(query);
@@ -39,10 +42,9 @@ async function fetchRemoteAccessConfigurations(pool) {
   }
 }
 
-
 /**
  * Transform database rows into site configuration format
- * Groups remote access configurations by site and builds site configuration object
+ * Each row is either type='neocore' or type='device'; build site.neocores and site.devices
  */
 function transformRemoteAccessToSites(remoteAccessConfigs) {
   const sitesMap = {};
@@ -50,117 +52,67 @@ function transformRemoteAccessToSites(remoteAccessConfigs) {
 
   remoteAccessConfigs.forEach((config) => {
     let siteSlug = config.site_slug;
-    
-    // Validate and sanitize site slug
+
     if (!siteSlug) {
-      console.warn(`⚠️  Remote access ${config.id} (${config.name}) has no site_slug - skipping`);
       invalidConfigs.push({ config, reason: 'missing_site_slug' });
       return;
     }
-    
-    // Sanitize slug if invalid format
+
     if (!isValidSiteSlug(siteSlug)) {
       const sanitized = sanitizeSiteSlug(siteSlug);
       if (sanitized && sanitized.length > 0) {
-        console.warn(`⚠️  Remote access ${config.id} has invalid site_slug "${siteSlug}" - sanitized to "${sanitized}"`);
         siteSlug = sanitized;
       } else {
-        console.error(`❌ Remote access ${config.id} has invalid site_slug "${siteSlug}" - cannot sanitize, skipping`);
         invalidConfigs.push({ config, reason: 'invalid_site_slug' });
         return;
       }
     }
-    
-    // Validate VPN IP
-    if (!config.vpn_ip) {
-      console.warn(`⚠️  Remote access ${config.id} (${config.name}) has no vpn_ip - skipping`);
-      invalidConfigs.push({ config, reason: 'missing_vpn_ip' });
+
+    if (!config.slug) {
+      invalidConfigs.push({ config, reason: 'missing_slug' });
       return;
     }
-    
-    // Validate VPN IP format (basic check)
+
     const ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
-    if (!ipPattern.test(config.vpn_ip)) {
-      console.error(`❌ Remote access ${config.id} has invalid vpn_ip "${config.vpn_ip}" - skipping`);
-      invalidConfigs.push({ config, reason: 'invalid_vpn_ip' });
+    if (!ipPattern.test(config.ip)) {
+      invalidConfigs.push({ config, reason: 'invalid_ip' });
       return;
     }
-    
-    // Initialize site if not exists
+
     if (!sitesMap[siteSlug]) {
       sitesMap[siteSlug] = {
         name: siteSlug,
-        vpnIp: config.vpn_ip,
-        siteName: config.site_name || siteSlug, // Human-readable site name
-        neocore: {
-          enabled: config.neocore_enabled || false,
-          target: config.neocore_enabled 
-            ? `http://${config.vpn_ip}:80`
-            : null,
-          wsTarget: config.neocore_enabled
-            ? `http://${config.vpn_ip}:5001`
-            : null,
-        },
+        siteName: config.site_name || siteSlug,
+        neocores: {},
         devices: {
           enabled: false,
           deviceList: {},
         },
-        remoteAccessCount: 0, // Track number of remote access configs per site
       };
     }
 
     const site = sitesMap[siteSlug];
-    site.remoteAccessCount++;
 
-    // Update NeoCore configuration if enabled
-    if (config.neocore_enabled) {
-      site.neocore.enabled = true;
-      site.neocore.target = `http://${config.vpn_ip}:80`;
-      site.neocore.wsTarget = `http://${config.vpn_ip}:5001`;
-    }
-
-    // Add devices from remote access config
-    if (config.devices && Array.isArray(config.devices) && config.devices.length > 0) {
+    if (config.type === 'neocore') {
+      site.neocores[config.slug] = {
+        target: `http://${config.ip}:${HTTP_PORT}`,
+        wsTarget: `http://${config.ip}:${WS_PORT}`,
+        name: config.name || config.slug,
+      };
+    } else if (config.type === 'device') {
       site.devices.enabled = true;
-      
-      config.devices.forEach((device) => {
-        if (!device.deviceId || !device.ip) {
-          console.warn(`⚠️  Device in remote access ${config.id} missing deviceId or ip - skipping`);
-          return;
-        }
-        
-        // Validate device IP format (should be 172.16.x.x for virtual IPs)
-        const virtualIpPattern = /^172\.16\.(\d{1,3})\.(\d{1,3})$/;
-        if (!virtualIpPattern.test(device.ip)) {
-          console.warn(`⚠️  Device ${device.deviceId} in remote access ${config.id} has invalid virtual IP "${device.ip}" (expected 172.16.x.x) - skipping`);
-          return;
-        }
-        
-        // Generate device target URL from virtual IP
-        const deviceTarget = `http://${device.ip}`;
-        
-        // Check for duplicate device IDs (same device in multiple configs)
-        if (site.devices.deviceList[device.deviceId]) {
-          console.warn(`⚠️  Device ${device.deviceId} already exists for site ${siteSlug} - overwriting`);
-        }
-        
-        site.devices.deviceList[device.deviceId] = {
-          name: device.name || device.deviceId,
-          virtualIp: device.ip, // Virtual IP (172.16.x.x)
-          target: deviceTarget,
-          actualIp: device.actualIp || null, // Optional: actual device IP behind NeoCore
-          icon: device.icon || null,
-          deviceType: device.deviceType || 'local',
-        };
-      });
+      site.devices.deviceList[config.slug] = {
+        name: config.name || config.slug,
+        virtualIp: config.ip,
+        target: `http://${config.ip}:${HTTP_PORT}`,
+      };
     }
   });
 
-  // Log validation results
   if (invalidConfigs.length > 0) {
-    console.warn(`⚠️  ${invalidConfigs.length} remote access config(s) skipped due to validation errors:`);
+    console.warn(`⚠️  ${invalidConfigs.length} remote access row(s) skipped:`);
     invalidConfigs.forEach(({ config, reason }) => {
-      console.warn(`   - Remote access ${config.id} (${config.name}): ${reason}`);
+      console.warn(`   - id ${config.id} (${config.type}/${config.slug}): ${reason}`);
     });
   }
 
@@ -169,53 +121,38 @@ function transformRemoteAccessToSites(remoteAccessConfigs) {
 
 /**
  * Fetch and transform remote access configurations
- * Returns site configuration object compatible with existing proxy structure
  */
 async function getSiteConfigurations(pool) {
   try {
     console.log('📊 Fetching remote access configurations from database...');
-    
-    const remoteAccessConfigs = await fetchRemoteAccessConfigurations(pool);
-    console.log(`✅ Found ${remoteAccessConfigs.length} remote access configuration(s)`);
 
-    if (remoteAccessConfigs.length === 0) {
-      console.log('⚠️  No remote access configurations found. Using static configuration fallback.');
-      return null; // Return null to use static config fallback
+    const rows = await fetchRemoteAccessConfigurations(pool);
+    console.log(`✅ Found ${rows.length} remote_access row(s)`);
+
+    if (rows.length === 0) {
+      console.log('⚠️  No remote access rows found. Using static configuration fallback.');
+      return null;
     }
 
-    const sites = transformRemoteAccessToSites(remoteAccessConfigs);
+    const sites = transformRemoteAccessToSites(rows);
     const siteCount = Object.keys(sites).length;
-    console.log(`✅ Transformed into ${siteCount} site configuration(s)`);
+    console.log(`✅ Transformed into ${siteCount} site(s)`);
 
-    // Log site details with validation info
     Object.values(sites).forEach((site) => {
-      const deviceCount = site.devices.deviceList 
-        ? Object.keys(site.devices.deviceList).length 
-        : 0;
-      const remoteAccessCount = site.remoteAccessCount || 1;
-      console.log(`   📍 ${site.name} (${site.siteName || site.name}):`);
-      console.log(`      VPN IP: ${site.vpnIp}`);
-      console.log(`      NeoCore: ${site.neocore.enabled ? '✅ enabled' : '❌ disabled'}`);
-      console.log(`      Devices: ${deviceCount}`);
-      console.log(`      Remote Access Configs: ${remoteAccessCount}`);
-      
-      // Validate site configuration
-      if (!site.neocore.enabled && deviceCount === 0) {
-        console.warn(`      ⚠️  Site ${site.name} has no NeoCore or devices enabled`);
-      }
+      const neocoreCount = Object.keys(site.neocores || {}).length;
+      const deviceCount = Object.keys(site.devices?.deviceList || {}).length;
+      console.log(`   📍 ${site.name}: ${neocoreCount} neocore(s), ${deviceCount} device(s)`);
     });
 
     return sites;
   } catch (error) {
     console.error('❌ Error getting site configurations:', error.message);
-    console.error('⚠️  Falling back to static configuration.');
-    return null; // Return null to use static config fallback
+    return null;
   }
 }
 
 /**
  * Refresh site configurations from database
- * Useful for periodic updates or manual refresh
  */
 async function refreshSiteConfigurations(pool) {
   return getSiteConfigurations(pool);
@@ -226,7 +163,6 @@ module.exports = {
   transformRemoteAccessToSites,
   getSiteConfigurations,
   refreshSiteConfigurations,
-  // Legacy exports for backward compatibility
   fetchDashboardsWithRemoteAccess: fetchRemoteAccessConfigurations,
   transformDashboardsToSites: transformRemoteAccessToSites,
 };

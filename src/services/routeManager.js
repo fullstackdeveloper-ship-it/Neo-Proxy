@@ -11,63 +11,66 @@ const { getSiteBySlug } = require("./siteCacheService");
 const fs = require('fs');
 const path = require('path');
 
+/** Helper: site has at least one neocore */
+function hasNeocores(site) {
+  return site?.neocores && typeof site.neocores === 'object' && Object.keys(site.neocores).length > 0;
+}
+
+/** Get site slug and neocore id from path e.g. /vpn/site1/neocore/0/... */
+function getSiteAndNeocoreFromPath(url) {
+  const m = url && url.match(/^\/vpn\/([^\/]+)\/neocore\/([^\/]+)(\/|$|\?)/);
+  return m ? { siteSlug: m[1], neocoreId: m[2] } : null;
+}
+
+/** Get neocore id from cookie */
+function getNeocoreIdFromCookie(req) {
+  if (!req.headers.cookie) return null;
+  const m = req.headers.cookie.match(/vpn-neocore=([^;,\s]+)/);
+  return m ? m[1].trim() : null;
+}
+
+/** Get neocore id from referer e.g. .../vpn/site1/neocore/0/... */
+function getNeocoreIdFromReferer(req) {
+  const referer = req.headers.referer || '';
+  const m = referer.match(/\/vpn\/([^\/]+)\/neocore\/([^\/]+)(\/|$|\?)/);
+  return m ? m[2] : null;
+}
+
 /**
  * Detect site from URL, referer header, or cookies
- * Now supports runtime database lookup with caching
+ * Supports runtime database lookup
  */
 async function detectSite(req, allSites) {
   let siteSlug = null;
-  
-  // Try URL path first (most reliable)
-  const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
-  if (urlMatch) {
-    siteSlug = urlMatch[1];
-  } else {
-    // Try referer header (full URL with path) - works for HTTP requests
+
+  const pathInfo = getSiteAndNeocoreFromPath(req.url);
+  if (pathInfo) siteSlug = pathInfo.siteSlug;
+  if (!siteSlug) {
     const referer = req.headers.referer || '';
     const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
-    if (refererMatch) {
-      siteSlug = refererMatch[1];
-    } else {
-      // Try origin header (might have path in some cases)
-      const origin = req.headers.origin || '';
-      const originMatch = origin.match(/\/vpn\/([^\/]+)\//);
-      if (originMatch) {
-        siteSlug = originMatch[1];
-      } else {
-        // Try cookie (if session-based approach was used)
-        if (req.headers.cookie) {
-          const cookieMatch = req.headers.cookie.match(/vpn-site=([^;]+)/);
-          if (cookieMatch) {
-            siteSlug = cookieMatch[1];
-          }
-        }
-      }
-    }
+    if (refererMatch) siteSlug = refererMatch[1];
   }
-  
   if (!siteSlug) {
-    return null;
+    const origin = req.headers.origin || '';
+    const originMatch = origin.match(/\/vpn\/([^\/]+)\//);
+    if (originMatch) siteSlug = originMatch[1];
   }
-  
-  // First check static sites
-  if (allSites[siteSlug]) {
-    return allSites[siteSlug];
+  if (!siteSlug && req.headers.cookie) {
+    const cookieMatch = req.headers.cookie.match(/vpn-site=([^;]+)/);
+    if (cookieMatch) siteSlug = cookieMatch[1].trim();
   }
-  
-  // Not in static config - try cache/database lookup
+
+  if (!siteSlug) return null;
+
+  if (allSites[siteSlug]) return allSites[siteSlug];
+
   try {
     const siteConfig = await getSiteBySlug(siteSlug);
-    if (siteConfig) {
-      // Add to allSites for this request (but don't modify the original object)
-      // Return the cached/looked-up site
-      return siteConfig;
-    }
+    return siteConfig || null;
   } catch (error) {
     console.error(`❌ Error looking up site ${siteSlug}:`, error.message);
+    return null;
   }
-  
-  return null;
 }
 
 /**
@@ -75,35 +78,52 @@ async function detectSite(req, allSites) {
  * Only checks static sites, not database
  */
 function detectSiteSync(req, allSites) {
-  // Try URL path first (most reliable)
-  const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
-  if (urlMatch) {
-    return allSites[urlMatch[1]];
+  const pathInfo = getSiteAndNeocoreFromPath(req.url);
+  if (pathInfo) {
+    const site = allSites[pathInfo.siteSlug];
+    if (site) return site;
   }
-  
-  // Try referer header (full URL with path) - works for HTTP requests
+  const urlMatch = req.url.match(/^\/vpn\/([^\/]+)\//);
+  if (urlMatch) return allSites[urlMatch[1]] || null;
   const referer = req.headers.referer || '';
   const refererMatch = referer.match(/\/vpn\/([^\/]+)\//);
-  if (refererMatch) {
-    return allSites[refererMatch[1]];
-  }
-  
-  // Try origin header (might have path in some cases)
+  if (refererMatch) return allSites[refererMatch[1]] || null;
   const origin = req.headers.origin || '';
   const originMatch = origin.match(/\/vpn\/([^\/]+)\//);
-  if (originMatch) {
-    return allSites[originMatch[1]];
-  }
-  
-  // Try cookie (if session-based approach was used)
+  if (originMatch) return allSites[originMatch[1]] || null;
   if (req.headers.cookie) {
     const cookieMatch = req.headers.cookie.match(/vpn-site=([^;]+)/);
-    if (cookieMatch) {
-      return allSites[cookieMatch[1]];
-    }
+    if (cookieMatch) return allSites[cookieMatch[1].trim()] || null;
   }
-  
   return null;
+}
+
+/**
+ * Detect site and neocore id for neocore routes (from path, referer, or cookie)
+ * Returns { site, neocoreId } or null
+ */
+async function detectSiteAndNeocore(req, allSites) {
+  const pathInfo = getSiteAndNeocoreFromPath(req.url);
+  let siteSlug = pathInfo?.siteSlug;
+  let neocoreId = pathInfo?.neocoreId;
+  if (!neocoreId) neocoreId = getNeocoreIdFromReferer(req);
+  if (!neocoreId) neocoreId = getNeocoreIdFromCookie(req);
+  if (!siteSlug) {
+    const referer = req.headers.referer || '';
+    const m = referer.match(/\/vpn\/([^\/]+)\//);
+    if (m) siteSlug = m[1];
+  }
+  if (!siteSlug && req.headers.cookie) {
+    const m = req.headers.cookie.match(/vpn-site=([^;]+)/);
+    if (m) siteSlug = m[1].trim();
+  }
+  if (!siteSlug || !neocoreId) return null;
+  let site = allSites[siteSlug];
+  if (!site) {
+    try { site = await getSiteBySlug(siteSlug); } catch (e) {}
+  }
+  if (!site || !hasNeocores(site) || !site.neocores[neocoreId]) return null;
+  return { site, neocoreId };
 }
 
 /**
@@ -219,335 +239,264 @@ function serveStaticFile(filePath, res, contentType) {
 
 /**
  * Register Neocore routes (HTML, assets, API, Socket.io)
+ * URL: /vpn/{site}/neocore/{neocoreId}/... for multiple neocores per site
  */
 function registerNeocoreRoutes(app, sitesOrGetter, server) {
-  // Helper function to get current sites (supports both object and getter function)
   const getCurrentSites = () => {
-    if (typeof sitesOrGetter === 'function') {
-      return sitesOrGetter();
-    }
+    if (typeof sitesOrGetter === 'function') return sitesOrGetter();
     return sitesOrGetter;
   };
-  
+
   const allSites = getCurrentSites();
-  
-  // Create socket.io proxies for each site FIRST (before other routes)
   const socketProxies = new Map();
   const apiProxies = new Map();
-  
+
   Object.values(allSites).forEach(site => {
-    if (site.neocore?.enabled) {
-      // Use wsTarget for WebSocket if available, otherwise use target
-      const wsTarget = site.neocore.wsTarget || site.neocore.target;
-      
-      // Socket.io proxy - site-specific (use wsTarget for WebSocket)
+    if (!hasNeocores(site)) return;
+    Object.entries(site.neocores).forEach(([neocoreId, neocoreConfig]) => {
+      const wsTarget = neocoreConfig.wsTarget || neocoreConfig.target;
+      const key = `${site.name}:${neocoreId}`;
+
       const socketProxy = createProxyMiddleware({
         target: wsTarget,
         changeOrigin: true,
-        // IMPORTANT: we handle ALL Socket.IO WebSocket upgrades ourselves via server.on('upgrade')
-        // Keep this middleware HTTP-only (polling) to avoid double-upgrade handling and "Invalid frame header"
         ws: false,
         xfwd: true,
         secure: false,
-        timeout: 0, // No timeout
-        proxyTimeout: 0, // No proxy timeout
-        pathRewrite: { [`^/vpn/${site.name}/neocore/socket.io`]: '/socket.io' },
+        timeout: 0,
+        proxyTimeout: 0,
+        pathRewrite: { [`^/vpn/${site.name}/neocore/${neocoreId}/socket.io`]: '/socket.io' },
         logLevel: 'warn',
         wsErrorHandler: (err, req, socket) => {
           const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
           if (!suppressErrors.includes(err.code)) {
-            console.error(`⚠️  WebSocket error (${site.name}):`, err.message);
+            console.error(`⚠️  WebSocket error (${site.name}/${neocoreId}):`, err.message);
           }
         },
         onError: (err, req, res) => {
           if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && !res.headersSent && !res.writableEnded) {
-            try {
-              res.status(502).json({ error: "Proxy error", message: err.message });
-            } catch (e) {}
+            try { res.status(502).json({ error: 'Proxy error', message: err.message }); } catch (e) {}
           }
-        }
+        },
       });
-      socketProxies.set(site.name, socketProxy);
-      
-      // API proxy - site-specific (use regular target)
+      socketProxies.set(key, socketProxy);
+
       const apiProxy = createProxy(
-        site.neocore.target,
-        { [`^/vpn/${site.name}/neocore/api`]: '/api' },
-        site.name
+        neocoreConfig.target,
+        { [`^/vpn/${site.name}/neocore/${neocoreId}/api`]: '/api' },
+        `${site.name}/${neocoreId}`
       );
-      apiProxies.set(site.name, apiProxy);
-      
-      console.log(`✅ Registered proxies for ${site.name}:`);
-      console.log(`   🔌 /vpn/${site.name}/neocore/socket.io → ${wsTarget}/socket.io`);
-      console.log(`   🌐 /vpn/${site.name}/neocore/api → ${site.neocore.target}/api`);
-    }
+      apiProxies.set(key, apiProxy);
+
+      console.log(`✅ Registered proxies for ${site.name} neocore ${neocoreId}:`);
+      console.log(`   🔌 /vpn/${site.name}/neocore/${neocoreId}/socket.io → ${wsTarget}/socket.io`);
+      console.log(`   🌐 /vpn/${site.name}/neocore/${neocoreId}/api → ${neocoreConfig.target}/api`);
+    });
   });
 
-  // URL rewrite interceptors (for HTTP requests - socket.io polling, API calls)
-  // Use getter function to get current sites dynamically (already defined above)
-  
-  // Root-level API handler (handles /api requests without site prefix - only for neocore)
+  // Root-level API handler (from referer/cookie: site + neocore)
   app.use('/api', async (req, res, next) => {
-    // Check if request is for neocore (from referer or cookie)
     const referer = req.headers.referer || '';
     const isNeocoreRequest = referer.includes('/neocore') || req.headers.cookie?.includes('vpn-site');
-    
-    if (!isNeocoreRequest) {
-      // Not a neocore request, skip
-      return next();
-    }
-    
+    if (!isNeocoreRequest) return next();
+
     const currentSites = getCurrentSites();
-    const site = await detectSite(req, currentSites);
-    
-    if (site?.neocore?.enabled) {
-      // Get or create API proxy for this site
-      let apiProxy = apiProxies.get(site.name);
-      
-      // If proxy doesn't exist (dynamic site from DB), create it
-      if (!apiProxy) {
-        apiProxy = createProxy(
-          site.neocore.target,
-          { [`^/vpn/${site.name}/neocore/api`]: '/api' },
-          site.name
-        );
-        apiProxies.set(site.name, apiProxy);
-        console.log(`✅ Created dynamic API proxy for ${site.name}`);
-      }
-      
-      // Save original URL and rewrite for proxy
-      const originalUrl = req.url;
-      const rewrittenUrl = `/vpn/${site.name}/neocore/api${req.url}`;
-      req.url = rewrittenUrl;
-      console.log(`🔄 API rewrite: ${originalUrl} → ${rewrittenUrl} (site: ${site.name})`);
-      
-      // Proxy the request (pathRewrite will strip the prefix back to /api)
-      return apiProxy(req, res, next);
-    } else {
-      console.warn(`⚠️  Could not detect site for ${req.url} (referer: ${req.headers.referer || 'none'})`);
-      return res.status(404).json({ error: 'Site not found or NeoCore not enabled' });
+    const detected = await detectSiteAndNeocore(req, currentSites);
+    if (!detected) {
+      return res.status(404).json({ error: 'Site or NeoCore not found' });
     }
+    const { site, neocoreId } = detected;
+    const key = `${site.name}:${neocoreId}`;
+    let apiProxy = apiProxies.get(key);
+    if (!apiProxy) {
+      const neocoreConfig = site.neocores[neocoreId];
+      apiProxy = createProxy(
+        neocoreConfig.target,
+        { [`^/vpn/${site.name}/neocore/${neocoreId}/api`]: '/api' },
+        `${site.name}/${neocoreId}`
+      );
+      apiProxies.set(key, apiProxy);
+    }
+    const originalUrl = req.url;
+    req.url = `/vpn/${site.name}/neocore/${neocoreId}/api${req.url}`;
+    if (process.env.DEBUG) console.log(`🔄 API rewrite: ${originalUrl} → ${req.url}`);
+    return apiProxy(req, res, next);
   });
 
-  // Register site-specific socket.io routes (MUST be before root-level route)
+  // Register per-site per-neocore socket.io and api routes (from initial config)
   Object.values(allSites).forEach(site => {
-    if (site.neocore?.enabled) {
-      app.use(`/vpn/${site.name}/neocore/socket.io`, socketProxies.get(site.name));
-      app.use(`/vpn/${site.name}/neocore/api`, apiProxies.get(site.name));
-    }
+    if (!hasNeocores(site)) return;
+    Object.keys(site.neocores).forEach(neocoreId => {
+      const key = `${site.name}:${neocoreId}`;
+      app.use(`/vpn/${site.name}/neocore/${neocoreId}/socket.io`, socketProxies.get(key));
+      app.use(`/vpn/${site.name}/neocore/${neocoreId}/api`, apiProxies.get(key));
+    });
   });
 
-  // Root-level socket.io route (fallback - handles /socket.io/ requests)
-  app.use('/socket.io', (req, res, next) => {
+  // Dynamic neocore api/socket.io (for DB-loaded sites not in initial config)
+  app.use('/vpn/:siteName/neocore/:neocoreId/api', async (req, res, next) => {
+    const { siteName, neocoreId } = req.params;
     const currentSites = getCurrentSites();
-    const site = detectSite(req, currentSites);
-    if (site?.neocore?.enabled) {
-      // NOTE: when mounted at '/socket.io', Express strips that prefix.
-      // If the browser hits '/socket.io/?EIO=4...', then req.url here is '/?EIO=4...'
-      // We must preserve the full path+query (including leading '/').
-      req.url = `/vpn/${site.name}/neocore/socket.io${req.url}`;
-      console.log(`🔄 Root socket.io rewrite: ${req.url} → ${site.name}`);
-      const proxy = socketProxies.get(site.name);
-      if (proxy) {
-        return proxy(req, res, next);
-      }
+    let site = currentSites[siteName];
+    if (!site?.neocores?.[neocoreId]) {
+      try { site = await getSiteBySlug(siteName); } catch (e) {}
     }
-    // Fallback to first site (not ideal, but better than failing)
-    const firstSite = Object.values(currentSites).find(s => s.neocore?.enabled);
-    if (firstSite) {
-      req.url = `/vpn/${firstSite.name}/neocore/socket.io${req.url}`;
-      console.log(`🔄 Root socket.io rewrite (fallback): ${req.url} → ${firstSite.name}`);
-      const proxy = socketProxies.get(firstSite.name);
-      if (proxy) {
-        return proxy(req, res, next);
-      }
+    if (!site?.neocores?.[neocoreId]) return next();
+    const key = `${site.name}:${neocoreId}`;
+    let apiProxy = apiProxies.get(key);
+    if (!apiProxy) {
+      const nc = site.neocores[neocoreId];
+      apiProxy = createProxy(nc.target, { [`^/vpn/${site.name}/neocore/${neocoreId}/api`]: '/api' }, key);
+      apiProxies.set(key, apiProxy);
     }
-    res.status(404).json({ error: 'Socket.io endpoint not found - no site detected' });
+    return apiProxy(req, res, next);
+  });
+  app.use('/vpn/:siteName/neocore/:neocoreId/socket.io', async (req, res, next) => {
+    const { siteName, neocoreId } = req.params;
+    const currentSites = getCurrentSites();
+    let site = currentSites[siteName];
+    if (!site?.neocores?.[neocoreId]) {
+      try { site = await getSiteBySlug(siteName); } catch (e) {}
+    }
+    if (!site?.neocores?.[neocoreId]) return next();
+    const key = `${site.name}:${neocoreId}`;
+    let socketProxy = socketProxies.get(key);
+    if (!socketProxy) {
+      const nc = site.neocores[neocoreId];
+      const wsTarget = nc.wsTarget || nc.target;
+      socketProxy = createProxyMiddleware({
+        target: wsTarget,
+        changeOrigin: true,
+        ws: false,
+        xfwd: true,
+        secure: false,
+        timeout: 0,
+        proxyTimeout: 0,
+        pathRewrite: { [`^/vpn/${site.name}/neocore/${neocoreId}/socket.io`]: '/socket.io' },
+        logLevel: 'warn',
+        onError: (err, req, res) => {
+          if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE' && !res.headersSent && !res.writableEnded) {
+            try { res.status(502).json({ error: 'Proxy error', message: err.message }); } catch (e) {}
+          }
+        },
+      });
+      socketProxies.set(key, socketProxy);
+    }
+    return socketProxy(req, res, next);
   });
 
-  // WebSocket upgrade handler - Manually handle upgrades for /socket.io without site prefix
-  // Create reusable proxy instances per site to avoid conflicts
+  // Root-level socket.io (from referer/cookie: site + neocore)
+  app.use('/socket.io', async (req, res, next) => {
+    const currentSites = getCurrentSites();
+    const detected = await detectSiteAndNeocore(req, currentSites);
+    if (detected) {
+      const { site, neocoreId } = detected;
+      const key = `${site.name}:${neocoreId}`;
+      req.url = `/vpn/${site.name}/neocore/${neocoreId}/socket.io${req.url}`;
+      const proxy = socketProxies.get(key);
+      if (proxy) return proxy(req, res, next);
+    }
+    const firstSite = Object.values(currentSites).find(s => hasNeocores(s));
+    const firstNeocoreId = firstSite && Object.keys(firstSite.neocores)[0];
+    if (firstSite && firstNeocoreId) {
+      req.url = `/vpn/${firstSite.name}/neocore/${firstNeocoreId}/socket.io${req.url}`;
+      const proxy = socketProxies.get(`${firstSite.name}:${firstNeocoreId}`);
+      if (proxy) return proxy(req, res, next);
+    }
+    res.status(404).json({ error: 'Socket.io endpoint not found - no site/neocore detected' });
+  });
+
+  // WebSocket upgrade handler - per-site per-neocore (key = site:neocoreId)
   if (server && socketProxies.size > 0) {
-    // Create reusable proxy instances for each site
     const wsProxies = new Map();
     Object.values(allSites).forEach(site => {
-      if (site.neocore?.enabled) {
-        // Use wsTarget if available (direct backend connection), otherwise use target (nginx)
-        const wsTarget = site.neocore.wsTarget || site.neocore.target;
+      if (!hasNeocores(site)) return;
+      Object.entries(site.neocores).forEach(([neocoreId, neocoreConfig]) => {
+        const wsTarget = neocoreConfig.wsTarget || neocoreConfig.target;
+        const key = `${site.name}:${neocoreId}`;
         const proxy = httpProxy.createProxyServer({
           target: wsTarget,
           ws: true,
           changeOrigin: true,
           secure: false,
-          timeout: 0, // No timeout - keep connection alive
-          proxyTimeout: 0, // No proxy timeout
-          xfwd: true, // Forward X-Forwarded-* headers
-          // Don't rewrite path - keep /socket.io as is
-          // Ensure WebSocket frames are forwarded immediately without buffering
-          buffer: false, // Disable buffering for WebSocket
+          timeout: 0,
+          proxyTimeout: 0,
+          xfwd: true,
+          buffer: false,
         });
-        
-        console.log(`   🔌 WebSocket proxy target for ${site.name}: ${wsTarget}`);
-        
-        // Handle proxy errors (including backend connection failures)
         proxy.on('error', (err, req, socket) => {
-          const wsTarget = site.neocore.wsTarget || site.neocore.target;
           const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
           if (!suppressErrors.includes(err.code)) {
-            console.error(`   ❌ WebSocket proxy error (${site.name}):`, err.message);
-            console.error(`   Code: ${err.code}, Target: ${wsTarget}`);
-            console.error(`   This usually means the backend is not reachable or not responding`);
-          } else if (err.code === 'ECONNREFUSED') {
-            // This is important - backend is not accepting connections
-            console.error(`   ⚠️  Backend connection refused (${site.name}): ${wsTarget}`);
-            console.error(`   Check if NeoCore backend is running and accessible`);
+            console.error(`   ❌ WebSocket proxy error (${site.name}/${neocoreId}):`, err.message);
           }
-          if (socket && !socket.destroyed) {
-            try {
-              socket.destroy();
-            } catch (e) {}
-          }
+          if (socket && !socket.destroyed) try { socket.destroy(); } catch (e) {}
         });
-        
-        // Handle WebSocket proxy request (before connecting to backend)
         proxy.on('proxyReqWs', (proxyReq, req, socket) => {
-          // Use wsTarget if available (direct backend), otherwise use target (nginx)
-          const wsTarget = site.neocore.wsTarget || site.neocore.target;
           const targetUrl = new URL(wsTarget);
-          
-          // Host header: Include port if not standard (80/443)
           const port = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
           const hostHeader = (port === '80' || port === '443') ? targetUrl.hostname : `${targetUrl.hostname}:${port}`;
-          
-          proxyReq.setHeader('Host', hostHeader); // Critical: Socket.IO needs correct Host header
+          proxyReq.setHeader('Host', hostHeader);
           proxyReq.setHeader('X-Forwarded-Proto', targetUrl.protocol === 'https:' ? 'wss' : 'ws');
           proxyReq.setHeader('X-Forwarded-For', req.socket.remoteAddress || req.headers['x-forwarded-for'] || '');
           proxyReq.setHeader('X-Real-IP', req.socket.remoteAddress || '');
-          
-          // Preserve original headers that Socket.IO might need
-          if (req.headers.origin) {
-            proxyReq.setHeader('Origin', req.headers.origin);
-          }
-          if (req.headers.cookie) {
-            proxyReq.setHeader('Cookie', req.headers.cookie);
-          }
-          
-          // Set Connection and Upgrade headers explicitly for WebSocket
+          if (req.headers.origin) proxyReq.setHeader('Origin', req.headers.origin);
+          if (req.headers.cookie) proxyReq.setHeader('Cookie', req.headers.cookie);
           proxyReq.setHeader('Connection', 'Upgrade');
           proxyReq.setHeader('Upgrade', 'websocket');
-          
-          console.log(`   🔗 Connecting to backend: ${wsTarget}${req.url}`);
-          console.log(`   Host header: ${hostHeader} (port: ${port})`);
         });
-        
-        // Handle WebSocket upgrade success (connection to backend established)
         proxy.on('open', (proxySocket) => {
-          const wsTarget = site.neocore.wsTarget || site.neocore.target;
-          console.log(`   ✅ WebSocket connection established to backend (${site.name})`);
-          console.log(`   📡 Real-time data should now flow`);
-          console.log(`   🔗 Connected to: ${wsTarget}`);
-          
-          // Ensure socket is in flowing mode (not paused) for immediate data forwarding
-          // DO NOT add 'data' event handlers - let http-proxy handle WebSocket frames automatically
           proxySocket.resume();
-          
-          // Only track errors and close events - don't interfere with data flow
           proxySocket.on('error', (err) => {
-            const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED'];
-            if (!suppressErrors.includes(err.code)) {
-              console.error(`   ❌ Proxy socket error (${site.name}):`, err.message);
+            if (!['ECONNRESET', 'EPIPE', 'ECONNREFUSED'].includes(err.code)) {
+              console.error(`   ❌ Proxy socket error (${site.name}/${neocoreId}):`, err.message);
             }
           });
-          
-          proxySocket.on('close', () => {
-            console.log(`   🔌 Proxy socket closed (${site.name})`);
-          });
         });
-        
-        // Handle WebSocket close
-        proxy.on('close', (res, socket, head) => {
-          console.log(`   🔌 WebSocket connection closed (${site.name})`);
-        });
-        
-        // Handle WebSocket proxy response (backend responded)
-        proxy.on('proxyRes', (proxyRes, req, res) => {
-          console.log(`   📥 Backend response: ${proxyRes.statusCode} (${site.name})`);
-        });
-        
-        // Handle WebSocket upgrade response
-        proxy.on('upgrade', (res, socket, head) => {
-          console.log(`   ⬆️  WebSocket upgrade response received (${site.name})`);
-          console.log(`   Status: ${res.statusCode}`);
-          if (res.statusCode !== 101) {
-            console.error(`   ⚠️  Unexpected status code: ${res.statusCode} (expected 101)`);
-          } else {
-            console.log(`   ✅ Upgrade successful - WebSocket protocol established`);
-            // Ensure upgrade response headers are properly set
-            if (res.headers) {
-              console.log(`   📋 Upgrade headers: Connection=${res.headers.connection}, Upgrade=${res.headers.upgrade}`);
-            }
-          }
-        });
-        
-        // Handle WebSocket error during upgrade
-        proxy.on('error', (err, req, socket) => {
-          const suppressErrors = ['ECONNRESET', 'EPIPE', 'ECONNREFUSED', 'ERR_STREAM_WRITE_AFTER_END'];
-          if (!suppressErrors.includes(err.code)) {
-            console.error(`   ❌ WebSocket proxy error during upgrade (${site.name}):`, err.message);
-            console.error(`   Code: ${err.code}`);
-          }
-        });
-        
-        wsProxies.set(site.name, proxy);
-      }
+        wsProxies.set(key, proxy);
+      });
     });
-    
-    // Handle WebSocket upgrades for root-level /socket.io requests
-    // We handle ALL socket.io websocket upgrades here (both root + site-prefixed),
-    // to guarantee single handling and avoid frame corruption.
+
     server.on('upgrade', (req, socket, head) => {
       const url = req.url || '';
       if (!url.includes('/socket.io')) return;
-      
-      // Get current sites dynamically
+
       const currentSites = getCurrentSites();
-
-      // Determine site
       let targetSite = null;
+      let targetNeocoreId = null;
 
-      // 1) If site is already in URL (prefixed)
-      const urlMatch = url.match(/^\/vpn\/([^\/]+)\/neocore\/socket\.io(\/|\?|$)/);
-      if (urlMatch) {
-        targetSite = currentSites[urlMatch[1]];
+      const pathInfo = getSiteAndNeocoreFromPath(url);
+      if (pathInfo) {
+        targetSite = currentSites[pathInfo.siteSlug];
+        targetNeocoreId = pathInfo.neocoreId;
       }
-
-      // 2) Cookie / referer / origin
-      if (!targetSite?.neocore?.enabled) {
+      if (!targetSite || !targetNeocoreId) {
         const cookieHeader = req.headers.cookie || '';
-        const cookieMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
-        if (cookieMatch) targetSite = currentSites[cookieMatch[1].trim()];
+        const siteMatch = cookieHeader.match(/vpn-site=([^;,\s]+)/);
+        const neocoreMatch = cookieHeader.match(/vpn-neocore=([^;,\s]+)/);
+        if (siteMatch) targetSite = currentSites[siteMatch[1].trim()];
+        if (neocoreMatch) targetNeocoreId = neocoreMatch[1].trim();
       }
-      // Use sync version for WebSocket (async not supported in upgrade handler)
-      if (!targetSite?.neocore?.enabled) targetSite = detectSiteSync(req, currentSites);
-      if (!targetSite?.neocore?.enabled) targetSite = Object.values(currentSites).find(s => s.neocore?.enabled);
+      if (!targetSite) targetSite = detectSiteSync(req, currentSites);
+      if (targetSite && !targetNeocoreId) targetNeocoreId = Object.keys(targetSite.neocores || {})[0];
+      if (!targetSite && currentSites) {
+        targetSite = Object.values(currentSites).find(s => hasNeocores(s));
+        if (targetSite) targetNeocoreId = Object.keys(targetSite.neocores)[0];
+      }
 
-      console.log(`🔌 WebSocket upgrade: ${url}`);
-      console.log(`   Site: ${targetSite?.name || 'NONE'}`);
-
-      if (!targetSite?.neocore?.enabled) {
-        console.error(`   ❌ No site detected, closing connection`);
+      if (!targetSite || !hasNeocores(targetSite) || !targetNeocoreId || !targetSite.neocores[targetNeocoreId]) {
+        console.error('   ❌ No site/neocore detected for WebSocket, closing');
         socket.destroy();
         return;
       }
 
-      // Ensure backend sees a pure Socket.IO path: /socket.io/...
-      if (url.startsWith(`/vpn/${targetSite.name}/neocore`)) {
-        req.url = url.replace(new RegExp(`^/vpn/${targetSite.name}/neocore`), '');
+      if (pathInfo && url.startsWith(`/vpn/${targetSite.name}/neocore/${targetNeocoreId}`)) {
+        req.url = url.replace(new RegExp(`^/vpn/${targetSite.name}/neocore/${targetNeocoreId}`), '');
       }
 
-      const proxy = wsProxies.get(targetSite.name);
+      const key = `${targetSite.name}:${targetNeocoreId}`;
+      const proxy = wsProxies.get(key);
       if (!proxy) {
-        console.error(`   ❌ wsProxy not found for site: ${targetSite.name}`);
+        console.error(`   ❌ wsProxy not found for ${key}`);
         socket.destroy();
         return;
       }
@@ -555,38 +504,32 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
       try {
         proxy.ws(req, socket, head);
       } catch (err) {
-        console.error(`   ❌ wsProxy.ws failed (${targetSite.name}): ${err.message}`);
+        console.error(`   ❌ wsProxy.ws failed (${key}): ${err.message}`);
         if (!socket.destroyed) socket.destroy();
       }
     });
-    
-    console.log(`✅ WebSocket upgrade handler registered (single handler; per-site proxies reused)`);
+
+    console.log('✅ WebSocket upgrade handler registered (per-site per-neocore)');
   }
 
-  // HTML route - with runtime database lookup
-  app.get('/vpn/:siteName/neocore', async (req, res) => {
+  // HTML route: /vpn/:siteName/neocore/:neocoreId (multiple neocores per site)
+  app.get('/vpn/:siteName/neocore/:neocoreId', async (req, res) => {
+    const { siteName, neocoreId } = req.params;
     const currentSites = getCurrentSites();
-    let site = currentSites[req.params.siteName];
-    
-    // If not in static config, try database lookup
-    if (!site?.neocore?.enabled) {
-      console.log(`🔍 Site ${req.params.siteName} not in static config, checking database...`);
+    let site = currentSites[siteName];
+
+    if (!site || !site.neocores?.[neocoreId]) {
       try {
-        site = await getSiteBySlug(req.params.siteName);
-        if (site) {
-          // Add to current sites temporarily for this request
-          // Note: This doesn't modify the original SITES object
-          console.log(`✅ Found site ${req.params.siteName} in database: VPN IP ${site.vpnIp}`);
-        }
+        site = await getSiteBySlug(siteName);
       } catch (error) {
-        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
+        console.error(`❌ Error looking up site ${siteName}:`, error.message);
       }
     }
-    
-    if (!site?.neocore?.enabled) {
-      return res.status(404).json({ error: 'Site not found' });
+
+    if (!site || !hasNeocores(site) || !site.neocores[neocoreId]) {
+      return res.status(404).json({ error: 'Site or NeoCore not found' });
     }
-    serveHTML(req, res, req.params.siteName);
+    serveHTML(req, res, siteName, neocoreId);
   });
 
   // Root-level assets
@@ -601,15 +544,10 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
 
   // Root-level images/icons (detect site from referer)
   app.get(/^\/([^\/]+\.(png|jpg|jpeg|svg|ico|gif|webp))$/, (req, res) => {
-    // Extract filename from URL path (remove leading slash)
     const fileName = req.path.substring(1);
     const currentSites = getCurrentSites();
-    const site = detectSite(req, currentSites) || Object.values(currentSites).find(s => s.neocore?.enabled);
-    
-    if (!site) {
-      return res.status(404).json({ error: 'Site not found' });
-    }
-    
+    const site = detectSite(req, currentSites) || Object.values(currentSites).find(s => hasNeocores(s));
+    if (!site) return res.status(404).json({ error: 'Site not found' });
     const assetPath = path.join(__dirname, '../build', fileName);
     const ext = path.extname(fileName).toLowerCase();
     const contentTypes = {
@@ -617,30 +555,23 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
       '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.gif': 'image/gif', '.webp': 'image/webp'
     };
     const contentType = contentTypes[ext] || 'application/octet-stream';
-    
     if (!serveStaticFile(assetPath, res, contentType)) {
       res.status(404).json({ error: 'Image not found' });
     } else if (process.env.DEBUG) {
-      console.log(`📷 Served root image: /${fileName} → ${site.name} (from ${req.headers.referer || 'direct'})`);
+      console.log(`📷 Served root image: /${fileName} → ${site.name}`);
     }
   });
 
-  // Site-prefixed static assets - with runtime database lookup
-  app.get('/vpn/:siteName/neocore/static/:type/:fileName', async (req, res) => {
+  // Site-prefixed neocore static assets: /vpn/:siteName/neocore/:neocoreId/static/:type/:fileName
+  app.get('/vpn/:siteName/neocore/:neocoreId/static/:type/:fileName', async (req, res) => {
+    const { siteName, neocoreId } = req.params;
     const currentSites = getCurrentSites();
-    let site = currentSites[req.params.siteName];
-    
-    // If not in static config, try database lookup
-    if (!site?.neocore?.enabled) {
-      try {
-        site = await getSiteBySlug(req.params.siteName);
-      } catch (error) {
-        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
-      }
+    let site = currentSites[siteName];
+    if (!site?.neocores?.[neocoreId]) {
+      try { site = await getSiteBySlug(siteName); } catch (e) {}
     }
-    
-    if (!site?.neocore?.enabled) {
-      return res.status(404).json({ error: 'Site not found' });
+    if (!site || !site.neocores?.[neocoreId]) {
+      return res.status(404).json({ error: 'Site or NeoCore not found' });
     }
     const assetPath = path.join(__dirname, '../build/static', req.params.type, req.params.fileName);
     const contentType = req.params.type === 'js' ? 'application/javascript' : 'text/css';
@@ -649,25 +580,22 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
     }
   });
 
-  // Root-level images/icons
-  app.get('/vpn/:siteName/neocore/:assetFile', async (req, res) => {
-    const currentSites = getCurrentSites();
-    let site = currentSites[req.params.siteName];
-    
-    // If not in static config, try database lookup
-    if (!site?.neocore?.enabled) {
-      try {
-        site = await getSiteBySlug(req.params.siteName);
-      } catch (error) {
-        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
-      }
-    }
-    
-    if (!site?.neocore?.enabled || req.params.assetFile.startsWith('api') || req.params.assetFile === 'static') {
+  // Site-prefixed neocore images: /vpn/:siteName/neocore/:neocoreId/:assetFile
+  app.get('/vpn/:siteName/neocore/:neocoreId/:assetFile', async (req, res) => {
+    const { siteName, neocoreId, assetFile } = req.params;
+    if (assetFile.startsWith('api') || assetFile === 'static') {
       return res.status(404).json({ error: 'Not found' });
     }
-    const assetPath = path.join(__dirname, '../build', req.params.assetFile);
-    const ext = path.extname(req.params.assetFile).toLowerCase();
+    const currentSites = getCurrentSites();
+    let site = currentSites[siteName];
+    if (!site?.neocores?.[neocoreId]) {
+      try { site = await getSiteBySlug(siteName); } catch (e) {}
+    }
+    if (!site || !site.neocores?.[neocoreId]) {
+      return res.status(404).json({ error: 'Site or NeoCore not found' });
+    }
+    const assetPath = path.join(__dirname, '../build', assetFile);
+    const ext = path.extname(assetFile).toLowerCase();
     const contentTypes = {
       '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
       '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.gif': 'image/gif', '.webp': 'image/webp'
@@ -678,24 +606,21 @@ function registerNeocoreRoutes(app, sitesOrGetter, server) {
     }
   });
 
-  // Catch-all for React Router (MUST be last)
-  app.get('/vpn/:siteName/neocore/*', async (req, res) => {
-    const currentSites = getCurrentSites();
-    let site = currentSites[req.params.siteName];
-    
-    // If not in static config, try database lookup
-    if (!site?.neocore?.enabled) {
-      try {
-        site = await getSiteBySlug(req.params.siteName);
-      } catch (error) {
-        console.error(`❌ Error looking up site ${req.params.siteName}:`, error.message);
-      }
-    }
-    
-    if (!site?.neocore?.enabled || req.url.includes('/api') || req.url.includes('/socket.io')) {
+  // Catch-all for React Router: /vpn/:siteName/neocore/:neocoreId/*
+  app.get('/vpn/:siteName/neocore/:neocoreId/*', async (req, res) => {
+    const { siteName, neocoreId } = req.params;
+    if (req.url.includes('/api') || req.url.includes('/socket.io')) {
       return res.status(404).json({ error: 'Not found' });
     }
-    serveHTML(req, res, req.params.siteName);
+    const currentSites = getCurrentSites();
+    let site = currentSites[siteName];
+    if (!site?.neocores?.[neocoreId]) {
+      try { site = await getSiteBySlug(siteName); } catch (e) {}
+    }
+    if (!site || !site.neocores?.[neocoreId]) {
+      return res.status(404).json({ error: 'Site or NeoCore not found' });
+    }
+    serveHTML(req, res, siteName, neocoreId);
   });
 }
 

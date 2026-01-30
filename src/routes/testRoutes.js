@@ -19,7 +19,7 @@ function registerTestRoutes(app, getSites, dbPool) {
   };
 
   /**
-   * Test endpoint: List all configured sites
+   * Test endpoint: List all configured sites (multiple neocores and devices per site)
    * GET /test/sites
    */
   app.get('/test/sites', (req, res) => {
@@ -28,12 +28,13 @@ function registerTestRoutes(app, getSites, dbPool) {
       const siteList = Object.values(sites).map(site => ({
         name: site.name,
         siteName: site.siteName || site.name,
-        vpnIp: site.vpnIp,
-        neocore: {
-          enabled: site.neocore?.enabled || false,
-          target: site.neocore?.target || null,
-          wsTarget: site.neocore?.wsTarget || null,
-        },
+        neocores: site.neocores ? Object.entries(site.neocores).map(([id, nc]) => ({
+          id,
+          name: nc.name || id,
+          target: nc.target,
+          wsTarget: nc.wsTarget,
+          url: `/vpn/${site.name}/neocore/${id}`,
+        })) : [],
         devices: {
           enabled: site.devices?.enabled || false,
           deviceCount: site.devices?.deviceList ? Object.keys(site.devices.deviceList).length : 0,
@@ -42,10 +43,9 @@ function registerTestRoutes(app, getSites, dbPool) {
             name: config.name || id,
             virtualIp: config.virtualIp,
             target: config.target,
-            deviceType: config.deviceType || 'local',
+            url: `/vpn/${site.name}/devices/${id}`,
           })) : [],
         },
-        dashboardCount: site.dashboardCount || 0,
       }));
 
       res.json({
@@ -63,7 +63,7 @@ function registerTestRoutes(app, getSites, dbPool) {
   });
 
   /**
-   * Test endpoint: Validate site configuration
+   * Test endpoint: Validate site configuration (multiple neocores and devices)
    * GET /test/validate/:siteName
    */
   app.get('/test/validate/:siteName', (req, res) => {
@@ -88,32 +88,21 @@ function registerTestRoutes(app, getSites, dbPool) {
         warnings: [],
       };
 
-      // Validate VPN IP
-      if (!site.vpnIp) {
-        validation.valid = false;
-        validation.errors.push('VPN IP is missing');
+      const neocoreCount = site.neocores ? Object.keys(site.neocores).length : 0;
+      if (neocoreCount === 0) {
+        validation.warnings.push('No NeoCore instances configured');
       } else {
-        const ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
-        if (!ipPattern.test(site.vpnIp)) {
-          validation.valid = false;
-          validation.errors.push(`Invalid VPN IP format: ${site.vpnIp}`);
-        }
+        Object.entries(site.neocores || {}).forEach(([neocoreId, nc]) => {
+          if (!nc.target) {
+            validation.valid = false;
+            validation.errors.push(`NeoCore ${neocoreId}: target is missing`);
+          }
+          if (!nc.wsTarget) {
+            validation.warnings.push(`NeoCore ${neocoreId}: wsTarget missing (will use target)`);
+          }
+        });
       }
 
-      // Validate NeoCore configuration
-      if (site.neocore?.enabled) {
-        if (!site.neocore.target) {
-          validation.valid = false;
-          validation.errors.push('NeoCore target is missing');
-        }
-        if (!site.neocore.wsTarget) {
-          validation.warnings.push('NeoCore WebSocket target is missing (will use regular target)');
-        }
-      } else {
-        validation.warnings.push('NeoCore is not enabled');
-      }
-
-      // Validate devices
       if (site.devices?.enabled) {
         const deviceList = site.devices.deviceList || {};
         const deviceCount = Object.keys(deviceList).length;
@@ -140,8 +129,7 @@ function registerTestRoutes(app, getSites, dbPool) {
         }
       }
 
-      // Check if site has any enabled features
-      if (!site.neocore?.enabled && !site.devices?.enabled) {
+      if (neocoreCount === 0 && (!site.devices?.enabled || Object.keys(site.devices?.deviceList || {}).length === 0)) {
         validation.warnings.push('Site has no NeoCore or devices enabled');
       }
 
@@ -214,15 +202,18 @@ function registerTestRoutes(app, getSites, dbPool) {
 
       res.json({
         success: true,
-        dashboardCount: dashboards.length,
-        dashboards: dashboards.map(d => ({
+        rowCount: dashboards.length,
+        rows: dashboards.map(d => ({
           id: d.id,
+          site_id: d.site_id,
+          type: d.type,
+          slug: d.slug,
           name: d.name,
-          siteSlug: d.site_slug,
-          siteName: d.site_name,
-          vpnIp: d.vpn_ip,
-          neocoreEnabled: d.neocore_enabled,
-          deviceCount: d.devices ? (Array.isArray(d.devices) ? d.devices.length : 0) : 0,
+          ip: d.ip,
+          site_slug: d.site_slug,
+          site_name: d.site_name,
+          is_active: d.is_active,
+          display_order: d.display_order,
         })),
       });
     } catch (error) {
@@ -281,8 +272,9 @@ function registerTestRoutes(app, getSites, dbPool) {
     try {
       const sites = getCurrentSites();
       const siteCount = Object.keys(sites).length;
-      const sitesWithNeoCore = Object.values(sites).filter(s => s.neocore?.enabled).length;
+      const sitesWithNeocore = Object.values(sites).filter(s => s.neocores && Object.keys(s.neocores).length > 0).length;
       const sitesWithDevices = Object.values(sites).filter(s => s.devices?.enabled).length;
+      const totalNeocores = Object.values(sites).reduce((sum, s) => sum + (s.neocores ? Object.keys(s.neocores).length : 0), 0);
       const totalDevices = Object.values(sites).reduce((sum, s) => {
         return sum + (s.devices?.deviceList ? Object.keys(s.devices.deviceList).length : 0);
       }, 0);
@@ -293,7 +285,8 @@ function registerTestRoutes(app, getSites, dbPool) {
         configuration: {
           source: dbPool ? 'database' : 'static',
           siteCount,
-          sitesWithNeoCore,
+          sitesWithNeocore,
+          totalNeocores,
           sitesWithDevices,
           totalDevices,
         },
