@@ -1,7 +1,7 @@
 /**
  * Site Lookup Service
  * Runtime lookup of site configurations by slug (fresh DB lookup)
- * Supports new schema: remote_access with type, slug, ip
+ * Supports new schema: remote_access_items with type, slug, ip
  */
 
 let dbPool = null;
@@ -50,7 +50,7 @@ async function lookupSiteBySlug(siteSlug) {
         ra.display_order,
         s.slug as site_slug,
         s.name as site_name
-      FROM remote_access ra
+      FROM remote_access_items ra
       INNER JOIN sites s ON ra.site_id = s.id
       WHERE s.slug = $1
         AND ra.ip IS NOT NULL

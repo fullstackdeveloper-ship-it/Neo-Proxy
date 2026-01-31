@@ -1,7 +1,7 @@
 /**
  * Database Service
  * Fetches remote access configurations from NeoSphere database
- * Single table: remote_access with type ('neocore'|'device'), slug, ip, site_id
+ * Single table: remote_access_items with type ('neocore'|'device'), slug, ip, site_id
  * Port 80 for HTTP, 5001 for WebSocket (fixed)
  */
 
@@ -11,7 +11,7 @@ const HTTP_PORT = 80;
 const WS_PORT = 5001;
 
 /**
- * Fetch all remote_access rows (neocore and device) with site info
+ * Fetch all remote_access_items rows (neocore and device) with site info
  */
 async function fetchRemoteAccessConfigurations(pool) {
   try {
@@ -27,7 +27,7 @@ async function fetchRemoteAccessConfigurations(pool) {
         ra.display_order,
         s.slug as site_slug,
         s.name as site_name
-      FROM remote_access ra
+      FROM remote_access_items ra
       INNER JOIN sites s ON ra.site_id = s.id
       WHERE ra.ip IS NOT NULL
         AND ra.is_active = true
@@ -127,7 +127,7 @@ async function getSiteConfigurations(pool) {
     console.log('📊 Fetching remote access configurations from database...');
 
     const rows = await fetchRemoteAccessConfigurations(pool);
-    console.log(`✅ Found ${rows.length} remote_access row(s)`);
+    console.log(`✅ Found ${rows.length} remote_access_items row(s)`);
 
     if (rows.length === 0) {
       console.log('⚠️  No remote access rows found. Using static configuration fallback.');
