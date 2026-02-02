@@ -9,25 +9,41 @@ const BUILD_DIR = path.join(__dirname, '../build');
 const ASSETS_DIR = path.join(BUILD_DIR, 'static');
 
 /**
- * Find main JS and CSS files dynamically
+ * Find main JS and CSS files dynamically from build/static
  */
 function findAssetFiles() {
   const jsDir = path.join(ASSETS_DIR, 'js');
   const cssDir = path.join(ASSETS_DIR, 'css');
-  
   let jsFile = null, cssFile = null;
-  
   if (fs.existsSync(jsDir)) {
     const files = fs.readdirSync(jsDir).filter(f => f.startsWith('main.') && f.endsWith('.js'));
     if (files.length > 0) jsFile = `js/${files[0]}`;
   }
-  
   if (fs.existsSync(cssDir)) {
     const files = fs.readdirSync(cssDir).filter(f => f.startsWith('main.') && f.endsWith('.css'));
     if (files.length > 0) cssFile = `css/${files[0]}`;
   }
-  
   return { jsFile, cssFile };
+}
+
+/**
+ * Get current main JS and CSS paths (asset-manifest.json or scan build/static)
+ */
+function getMainAssetPaths() {
+  const manifestPath = path.join(BUILD_DIR, 'asset-manifest.json');
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const mainJs = manifest.files?.['main.js'] || manifest.entrypoints?.find(e => e.endsWith('.js'));
+      const mainCss = manifest.files?.['main.css'] || manifest.entrypoints?.find(e => e.endsWith('.css'));
+      if (mainJs && mainCss) return { jsPath: mainJs.startsWith('/') ? mainJs : '/' + mainJs, cssPath: mainCss.startsWith('/') ? mainCss : '/' + mainCss };
+    } catch (e) {}
+  }
+  const { jsFile, cssFile } = findAssetFiles();
+  if (jsFile && cssFile) {
+    return { jsPath: `/static/${jsFile}`, cssPath: `/static/${cssFile}` };
+  }
+  return null;
 }
 
 /**
@@ -81,6 +97,13 @@ function serveHTML(req, res, siteName, neocoreId) {
 
     let html = fs.readFileSync(htmlPath, 'utf8');
 
+    // Rewrite script/link to current main JS/CSS from build (survives new builds)
+    const assets = getMainAssetPaths();
+    if (assets) {
+      html = html.replace(/src="\/static\/js\/main\.[^"]+\.js"/, `src="${assets.jsPath}"`);
+      html = html.replace(/href="\/static\/css\/main\.[^"]+\.css"/, `href="${assets.cssPath}"`);
+    }
+
     if (siteName) {
       const basePath = neocoreId
         ? `/vpn/${siteName}/neocore/${neocoreId}`
@@ -108,6 +131,7 @@ function serveHTML(req, res, siteName, neocoreId) {
     }
 
     res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.send(html);
   } catch (err) {
     if (!res.headersSent) {
